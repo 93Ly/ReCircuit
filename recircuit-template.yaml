@@ -1,0 +1,625 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ReCircuit - serverless e-waste collection platform (Free Tier friendly)
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Receives ALL status notifications and alarms (confirm the SNS email after deploy)
+
+Resources:
+  # ---------- Storage ----------
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-old-photos
+            Status: Enabled
+            Transitions:
+              - { StorageClass: GLACIER, TransitionInDays: 90 }
+      Tags: [{ Key: Project, Value: recircuit }]
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags: [{ Key: Project, Value: recircuit }]
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  OAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OAC.Id
+            S3OriginConfig: { OriginAccessIdentity: '' }
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # CachingDisabled (easy to update during dev)
+
+  # ---------- Database ----------
+  DevicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: deviceId, AttributeType: S }
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema: [{ AttributeName: deviceId, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema: [{ AttributeName: userId, KeyType: HASH }]
+          Projection: { ProjectionType: ALL }
+      StreamSpecification: { StreamViewType: NEW_AND_OLD_IMAGES }
+      Tags: [{ Key: Project, Value: recircuit }]
+
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: requestId, AttributeType: S }]
+      KeySchema: [{ AttributeName: requestId, KeyType: HASH }]
+      Tags: [{ Key: Project, Value: recircuit }]
+
+  # ---------- Messaging ----------
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags: [{ Key: Project, Value: recircuit }]
+
+  AdminSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+
+  TopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref Topic]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref Topic
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  PickupQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+        maxReceiveCount: 3
+
+  # ---------- IAM ----------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: recircuit-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt DevicesTable.Arn
+                  - !Sub '${DevicesTable.Arn}/index/*'
+                  - !GetAtt RequestsTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
+                Resource: !GetAtt DevicesTable.StreamArn
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub '${PhotoBucket.Arn}/*'
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt PickupQueue.Arn
+              - Effect: Allow
+                Action: [sns:Publish, sns:Subscribe]
+                Resource: !Ref Topic
+
+  # ---------- Lambda ----------
+  DevicesFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 15
+      Environment:
+        Variables: { DEVICES: !Ref DevicesTable, BUCKET: !Ref PhotoBucket }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, re, uuid, time, boto3
+          from boto3.dynamodb.conditions import Key
+          from botocore.config import Config
+          T = boto3.resource('dynamodb').Table(os.environ['DEVICES'])
+          s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+          B = os.environ['BUCKET']
+          CATS = ('REUSE', 'REPAIR', 'RECYCLE')
+          SEE = {'collectors': ('SCHEDULED', 'COLLECTED', 'REPAIRED', 'RETURNED'),
+                 'repairers': ('COLLECTED', 'IN_REPAIR', 'REPAIRED', 'UNREPAIRABLE'),
+                 'processors': ('COLLECTED', 'UNREPAIRABLE', 'PROCESSING', 'REUSED', 'RECYCLED')}
+          def resp(c, b):
+              return {'statusCode': c, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(b, default=str)}
+          def role_of(cl):
+              g = re.findall(r'[a-z]+', str(cl.get('cognito:groups', '')))
+              return next((r for r in SEE if r in g), 'user')
+          def visible(role, d):
+              if d['status'] not in SEE[role]:
+                  return False
+              if d['status'] == 'COLLECTED' and role != 'collectors':
+                  return (d['category'] == 'REPAIR') == (role == 'repairers')
+              return True
+          def handler(e, ctx):
+              cl = e['requestContext']['authorizer']['jwt']['claims']
+              uid = cl['sub']
+              role = role_of(cl)
+              rk = e['routeKey']
+              body = json.loads(e.get('body') or '{}')
+              if rk in ('POST /upload-url', 'POST /devices') and role != 'user':
+                  return resp(403, {'error': 'customers only'})
+              if rk == 'POST /upload-url':
+                  key = uid + '/' + str(uuid.uuid4())
+                  url = s3.generate_presigned_url('put_object', Params={'Bucket': B, 'Key': key, 'ContentType': body.get('contentType', 'image/jpeg')}, ExpiresIn=300)
+                  return resp(200, {'uploadUrl': url, 'photoKey': key})
+              if rk == 'POST /devices':
+                  if body.get('category') not in CATS or not body.get('name'):
+                      return resp(400, {'error': 'name and a valid category are required'})
+                  now = int(time.time())
+                  item = {'deviceId': str(uuid.uuid4()), 'userId': uid, 'name': body['name'][:100],
+                          'type': body.get('type', 'other'), 'condition': body.get('condition', 'unknown'),
+                          'category': body['category'], 'status': 'REGISTERED',
+                          'photoKey': body.get('photoKey', ''), 'createdAt': now,
+                          'history': [{'s': 'REGISTERED', 't': now}]}
+                  T.put_item(Item=item)
+                  return resp(201, item)
+              if rk == 'GET /devices':
+                  if role == 'user':
+                      items = T.query(IndexName='userId-index', KeyConditionExpression=Key('userId').eq(uid))['Items']
+                  else:
+                      items = [d for d in T.scan()['Items'] if visible(role, d)]
+                  for i in items:
+                      if i.get('photoKey'):
+                          i['photoUrl'] = s3.generate_presigned_url('get_object', Params={'Bucket': B, 'Key': i['photoKey']}, ExpiresIn=300)
+                      if role not in ('user', 'collectors'):
+                          i.pop('userId', None)
+                          i.pop('address', None)
+                  return resp(200, {'items': items, 'role': role})
+              return resp(404, {'error': 'not found'})
+
+  ActionsFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          DEVICES: !Ref DevicesTable
+          REQUESTS: !Ref RequestsTable
+          QUEUE: !Ref PickupQueue
+          TOPIC: !Ref Topic
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, re, time, boto3
+          ddb = boto3.resource('dynamodb')
+          D = ddb.Table(os.environ['DEVICES'])
+          R = ddb.Table(os.environ['REQUESTS'])
+          sqs = boto3.client('sqs')
+          sns = boto3.client('sns')
+          STAFF = ('collectors', 'repairers', 'processors')
+          # (current status, new status) -> role allowed to make the change
+          TR = {('SCHEDULED', 'COLLECTED'): 'collectors',
+                ('COLLECTED', 'IN_REPAIR'): 'repairers',
+                ('COLLECTED', 'PROCESSING'): 'processors',
+                ('IN_REPAIR', 'REPAIRED'): 'repairers',
+                ('IN_REPAIR', 'UNREPAIRABLE'): 'repairers',
+                ('UNREPAIRABLE', 'PROCESSING'): 'processors',
+                ('REPAIRED', 'RETURNED'): 'collectors',
+                ('PROCESSING', 'REUSED'): 'processors',
+                ('PROCESSING', 'RECYCLED'): 'processors'}
+          def resp(c, b):
+              return {'statusCode': c, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(b, default=str)}
+          def setstatus(did, st, addr=None):
+              ex = 'SET #s=:s, history=list_append(if_not_exists(history,:e),:h)'
+              vals = {':s': st, ':e': [], ':h': [{'s': st, 't': int(time.time())}]}
+              if addr is not None:
+                  ex += ', address=:a'
+                  vals[':a'] = addr
+              D.update_item(Key={'deviceId': did}, UpdateExpression=ex, ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues=vals)
+          def handler(e, ctx):
+              cl = e['requestContext']['authorizer']['jwt']['claims']
+              uid = cl['sub']
+              g = re.findall(r'[a-z]+', str(cl.get('cognito:groups', '')))
+              role = next((r for r in STAFF if r in g), 'user')
+              rk = e['routeKey']
+              body = json.loads(e.get('body') or '{}')
+              if rk == 'POST /subscribe':
+                  try:
+                      sns.subscribe(TopicArn=os.environ['TOPIC'], Protocol='email', Endpoint=cl['email'],
+                                    Attributes={'FilterPolicy': json.dumps({'userId': [uid]})})
+                  except Exception as ex:
+                      print('subscribe failed:', ex)
+                      return resp(200, {'message': 'This email is already subscribed, so you will receive updates.'})
+                  return resp(200, {'message': 'Check your inbox and confirm the subscription email'})
+              did = e['pathParameters']['id']
+              d = D.get_item(Key={'deviceId': did}).get('Item')
+              if not d:
+                  return resp(404, {'error': 'device not found'})
+              if rk == 'POST /devices/{id}/pickup':
+                  if d['userId'] != uid or role != 'user':
+                      return resp(403, {'error': 'not your device'})
+                  if d['status'] != 'REGISTERED':
+                      return resp(409, {'error': 'pickup already requested'})
+                  addr = (body.get('address') or '').strip()[:200]
+                  if not addr:
+                      return resp(400, {'error': 'address is required'})
+                  R.put_item(Item={'requestId': did, 'deviceId': did, 'userId': uid, 'address': addr,
+                                   'status': 'PENDING', 'createdAt': int(time.time())})
+                  setstatus(did, 'PICKUP_REQUESTED', addr)
+                  sqs.send_message(QueueUrl=os.environ['QUEUE'], MessageBody=json.dumps({'requestId': did, 'deviceId': did}))
+                  return resp(202, {'message': 'pickup requested'})
+              if rk == 'PATCH /devices/{id}/status':
+                  new = body.get('status')
+                  if not isinstance(new, str):
+                      return resp(400, {'error': 'status is required'})
+                  need = TR.get((d['status'], new))
+                  if not need:
+                      return resp(409, {'error': 'that status change is not allowed'})
+                  if role != need:
+                      return resp(403, {'error': 'only ' + need + ' can do this step'})
+                  if new == 'IN_REPAIR' and d['category'] != 'REPAIR':
+                      return resp(409, {'error': 'this device is not marked for repair'})
+                  if (d['status'], new) == ('COLLECTED', 'PROCESSING') and d['category'] == 'REPAIR':
+                      return resp(409, {'error': 'this device must be repaired first'})
+                  setstatus(did, new)
+                  return resp(200, {'message': 'updated'})
+              return resp(404, {'error': 'not found'})
+
+  WorkerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables: { DEVICES: !Ref DevicesTable, REQUESTS: !Ref RequestsTable }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, time, datetime, boto3
+          ddb = boto3.resource('dynamodb')
+          D = ddb.Table(os.environ['DEVICES'])
+          R = ddb.Table(os.environ['REQUESTS'])
+          def handler(e, ctx):
+              day = datetime.date.today() + datetime.timedelta(days=2)
+              slot = day.isoformat() + ' 10:00-13:00'
+              for r in e['Records']:
+                  m = json.loads(r['body'])
+                  R.update_item(Key={'requestId': m['requestId']}, UpdateExpression='SET #s=:s, slot=:t',
+                                ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': 'SCHEDULED', ':t': slot})
+                  D.update_item(Key={'deviceId': m['deviceId']},
+                                UpdateExpression='SET #s=:s, slot=:t, history=list_append(if_not_exists(history,:e),:h)',
+                                ExpressionAttributeNames={'#s': 'status'},
+                                ExpressionAttributeValues={':s': 'SCHEDULED', ':t': slot, ':e': [], ':h': [{'s': 'SCHEDULED', 't': int(time.time())}]})
+
+  NotifierFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables: { TOPIC: !Ref Topic }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import os, boto3
+          sns = boto3.client('sns')
+          TXT = {'PICKUP_REQUESTED': 'We received your pickup request.',
+                 'SCHEDULED': 'Pickup scheduled.',
+                 'COLLECTED': 'Our collector picked it up.',
+                 'IN_REPAIR': 'It is now being repaired.',
+                 'REPAIRED': 'It has been repaired and will be returned to you.',
+                 'UNREPAIRABLE': 'It could not be repaired and will go to recycling/reuse.',
+                 'PROCESSING': 'It reached our processing partner.',
+                 'REUSED': 'It was refurbished and given a second life.',
+                 'RECYCLED': 'It was recycled responsibly.',
+                 'RETURNED': 'It has been returned to you.'}
+          def handler(e, ctx):
+              for r in e['Records']:
+                  if r['eventName'] != 'MODIFY':
+                      continue
+                  n = r['dynamodb']['NewImage']
+                  o = r['dynamodb']['OldImage']
+                  st = n['status']['S']
+                  if st == o['status']['S']:
+                      continue
+                  slot = n.get('slot', {}).get('S', '')
+                  msg = "ReCircuit update for '%s': %s" % (n['name']['S'], st.replace('_', ' ').title())
+                  msg += '. ' + TXT.get(st, '')
+                  if st == 'SCHEDULED' and slot:
+                      msg += ' Slot: ' + slot + '.'
+                  sns.publish(TopicArn=os.environ['TOPIC'], Subject='ReCircuit status update', Message=msg,
+                              MessageAttributes={'userId': {'DataType': 'String', 'StringValue': n['userId']['S']}})
+
+  PickupMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PickupQueue.Arn
+      FunctionName: !Ref WorkerFn
+      BatchSize: 1
+
+  StreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DevicesTable.StreamArn
+      FunctionName: !Ref NotifierFn
+      StartingPosition: LATEST
+      BatchSize: 10
+
+  # ---------- Auth ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: recircuit-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy: { MinimumLength: 8, RequireLowercase: true, RequireNumbers: true, RequireUppercase: false, RequireSymbols: false }
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+
+  CollectorsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: collectors
+      Description: Collectors - pick up devices and deliver repaired ones back
+
+  RepairersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: repairers
+      Description: Repair technicians
+
+  ProcessorsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: processors
+      Description: Recycling and reuse processors
+
+  # ---------- API ----------
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: recircuit-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, PATCH, OPTIONS]
+        AllowHeaders: [authorization, content-type]
+
+  Authorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref Api
+      AuthorizerType: JWT
+      Name: cognito
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+        Audience: [!Ref UserPoolClient]
+
+  DevicesIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt DevicesFn.Arn
+
+  ActionsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt ActionsFn.Arn
+
+  RouteUpload:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /upload-url
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${DevicesIntegration}'
+
+  RouteCreate:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /devices
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${DevicesIntegration}'
+
+  RouteList:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /devices
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${DevicesIntegration}'
+
+  RoutePickup:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /devices/{id}/pickup
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ActionsIntegration}'
+
+  RouteStatus:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: PATCH /devices/{id}/status
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ActionsIntegration}'
+
+  RouteSubscribe:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /subscribe
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ActionsIntegration}'
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  DevicesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DevicesFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  ActionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ActionsFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  # ---------- Monitoring ----------
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Pickup requests failed processing and landed in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt DLQ.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Topic]
+
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Errors in the API Lambda
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref DevicesFn }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Topic]
+
+Outputs:
+  SiteUrl:
+    Value: !Sub 'https://${Distribution.DomainName}/'
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  ApiUrl:
+    Value: !GetAtt Api.ApiEndpoint
+  Region:
+    Value: !Ref AWS::Region
+  ClientId:
+    Value: !Ref UserPoolClient
+  UserPoolId:
+    Value: !Ref UserPool

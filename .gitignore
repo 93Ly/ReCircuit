@@ -1,0 +1,7 @@
+# university material, not ours to publish
+CLOUD-ARCHITECTURE-DESIGN.pdf
+# account-specific deployment values (copy frontend/config.example.js to config.js)
+frontend/config.js
+# Windows folder metadata
+desktop.ini
+Desktop.ini
