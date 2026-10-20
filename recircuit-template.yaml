@@ -981,7 +981,7 @@ Resources:
       PayloadFormatVersion: '2.0'
       IntegrationUri: !GetAtt RegisterFn.Arn
 
-  RegisterRoute1:
+  RouteUpload:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
@@ -999,7 +999,7 @@ Resources:
       AuthorizerId: !Ref Authorizer
       Target: !Sub 'integrations/${RegisterIntegration}'
 
-  RegisterRoute3:
+  RouteCreate:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
@@ -1024,7 +1024,7 @@ Resources:
       PayloadFormatVersion: '2.0'
       IntegrationUri: !GetAtt ListFn.Arn
 
-  ListRoute1:
+  RouteList:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
@@ -1049,7 +1049,7 @@ Resources:
       PayloadFormatVersion: '2.0'
       IntegrationUri: !GetAtt PickupFn.Arn
 
-  PickupRoute1:
+  RoutePickup:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
@@ -1117,7 +1117,7 @@ Resources:
       PayloadFormatVersion: '2.0'
       IntegrationUri: !GetAtt StatusFn.Arn
 
-  StatusRoute1:
+  RouteStatus:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
@@ -1142,7 +1142,7 @@ Resources:
       PayloadFormatVersion: '2.0'
       IntegrationUri: !GetAtt SubscribeFn.Arn
 
-  SubscribeRoute1:
+  RouteSubscribe:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
