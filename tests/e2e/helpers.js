@@ -75,8 +75,8 @@ async function signedIn(page, base, token) {
 }
 
 const dev = (o = {}) => ({
-  deviceId: 'abcdef123456', userId: 'user-1', name: 'Dell Laptop', type: 'laptop', condition: 'working',
-  category: 'REUSE', status: 'REGISTERED', createdAt: 1760000000, history: [{ s: 'REGISTERED', t: 1760000000 }], ...o
+  deviceId: 'abcdef123456', userId: 'user-1', name: 'Dell Laptop', type: 'laptop', condition: 'working', age: 3,
+  category: 'REUSE', assessment: { recommended: 'REUSE', reason: 'Working and at most 8 years old: suitable for refurbishment and reuse' }, status: 'REGISTERED', createdAt: 1760000000, history: [{ s: 'REGISTERED', t: 1760000000 }], ...o
 });
 
 module.exports = { serve, launch, mock, jwt, config, signedIn, dev };

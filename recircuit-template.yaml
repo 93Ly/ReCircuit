@@ -1,10 +1,22 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: ReCircuit - serverless e-waste collection platform (Free Tier friendly)
+Description: ReCircuit - serverless e-waste collection platform with triage, marketplace and slot booking (Free Tier friendly)
 
 Parameters:
   AdminEmail:
     Type: String
     Description: Receives ALL status notifications and alarms (confirm the SNS email after deploy)
+  SlotCapacity:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: Maximum number of pickups that can be booked into one time slot
+  CancelCutoffHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: Customers can reschedule or cancel a pickup until this many hours before it starts
 
 Resources:
   # ---------- Storage ----------
@@ -26,10 +38,12 @@ Resources:
             AllowedHeaders: ['*']
       LifecycleConfiguration:
         Rules:
-          - Id: archive-old-photos
+          - Id: archive-then-delete-photos
             Status: Enabled
             Transitions:
               - { StorageClass: GLACIER, TransitionInDays: 90 }
+            ExpirationInDays: 365
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
       Tags: [{ Key: Project, Value: recircuit }]
 
   SiteBucket:
@@ -81,11 +95,12 @@ Resources:
           ViewerProtocolPolicy: redirect-to-https
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # CachingDisabled (easy to update during dev)
 
-  # ---------- Database ----------
+  # ---------- Database (provisioned capacity stays inside the always-free 25 read / 25 write units) ----------
   DevicesTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      BillingMode: PAY_PER_REQUEST
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
       AttributeDefinitions:
         - { AttributeName: deviceId, AttributeType: S }
         - { AttributeName: userId, AttributeType: S }
@@ -94,15 +109,29 @@ Resources:
         - IndexName: userId-index
           KeySchema: [{ AttributeName: userId, KeyType: HASH }]
           Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 2, WriteCapacityUnits: 2 }
       StreamSpecification: { StreamViewType: NEW_AND_OLD_IMAGES }
+      TimeToLiveSpecification: { AttributeName: expiresAt, Enabled: true }
       Tags: [{ Key: Project, Value: recircuit }]
 
   RequestsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      BillingMode: PAY_PER_REQUEST
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 1, WriteCapacityUnits: 1 }
       AttributeDefinitions: [{ AttributeName: requestId, AttributeType: S }]
       KeySchema: [{ AttributeName: requestId, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: expiresAt, Enabled: true }
+      Tags: [{ Key: Project, Value: recircuit }]
+
+  SlotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }
+      AttributeDefinitions: [{ AttributeName: slotId, AttributeType: S }]
+      KeySchema: [{ AttributeName: slotId, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: expiresAt, Enabled: true }
       Tags: [{ Key: Project, Value: recircuit }]
 
   # ---------- Messaging ----------
@@ -142,8 +171,8 @@ Resources:
         deadLetterTargetArn: !GetAtt DLQ.Arn
         maxReceiveCount: 3
 
-  # ---------- IAM ----------
-  LambdaRole:
+  # ---------- IAM: one least-privilege role per function ----------
+  RegisterRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -154,35 +183,201 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: recircuit-access
+        - PolicyName: RegisterFn-access
           PolicyDocument:
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Action: [dynamodb:PutItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${PhotoBucket.Arn}/*'
+
+  ListRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ListFn-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:Scan]
                 Resource:
                   - !GetAtt DevicesTable.Arn
                   - !Sub '${DevicesTable.Arn}/index/*'
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub '${PhotoBucket.Arn}/*'
+
+  PickupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PickupFn-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem]
+                Resource: !GetAtt RequestsTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:Scan]
+                Resource: !GetAtt SlotsTable.Arn
+              - Effect: Allow
+                Action: [sqs:SendMessage]
+                Resource: !GetAtt PickupQueue.Arn
+
+  ChangeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ChangeFn-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !GetAtt SlotsTable.Arn
+
+  StatusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StatusFn-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !GetAtt SlotsTable.Arn
+
+  SubscribeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SubscribeFn-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [sns:Subscribe]
+                Resource: !Ref Topic
+
+  MarketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MarketFn-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub '${PhotoBucket.Arn}/*'
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkerFn-access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DevicesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource:
                   - !GetAtt RequestsTable.Arn
+                  - !GetAtt SlotsTable.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt PickupQueue.Arn
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NotifierFn-access
+          PolicyDocument:
+            Statement:
               - Effect: Allow
                 Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
                 Resource: !GetAtt DevicesTable.StreamArn
               - Effect: Allow
-                Action: [s3:PutObject, s3:GetObject]
-                Resource: !Sub '${PhotoBucket.Arn}/*'
-              - Effect: Allow
-                Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
-                Resource: !GetAtt PickupQueue.Arn
-              - Effect: Allow
-                Action: [sns:Publish, sns:Subscribe]
+                Action: [sns:Publish]
                 Resource: !Ref Topic
 
   # ---------- Lambda ----------
-  DevicesFn:
+  RegisterFn:
     Type: AWS::Lambda::Function
     Properties:
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt LambdaRole.Arn
+      Role: !GetAtt RegisterRole.Arn
       Timeout: 15
       Environment:
         Variables: { DEVICES: !Ref DevicesTable, BUCKET: !Ref PhotoBucket }
@@ -190,20 +385,78 @@ Resources:
       Code:
         ZipFile: |
           import json, os, re, uuid, time, boto3
+          from botocore.config import Config
+          T = boto3.resource('dynamodb').Table(os.environ['DEVICES'])
+          s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+          CATS = ('REUSE', 'REPAIR', 'RECYCLE')
+          UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+          TYPES = ('laptop', 'phone', 'tablet', 'battery', 'appliance', 'other')
+          RULES = {'working': (8, 'REUSE', 'Working and at most 8 years old: suitable for refurbishment and reuse'),
+                   'needs repair': (6, 'REPAIR', 'Repairable and at most 6 years old: worth repairing'),
+                   'broken': (3, 'REPAIR', 'Broken but at most 3 years old: assess it for repair')}
+          def resp(c, b):
+              return {'statusCode': c, 'body': json.dumps(b, default=str)}
+          def triage(t, c, age):
+              if t == 'battery':
+                  return 'RECYCLE', 'Batteries are hazardous and are never repaired or reused'
+              lim, rec, why = RULES[c]
+              return (rec, why) if age <= lim else ('RECYCLE', 'Older than %d years for this condition: recycle to recover the materials' % lim)
+          def handler(e, ctx):
+              cl = e['requestContext']['authorizer']['jwt']['claims']
+              uid = cl['sub']
+              if re.search(r'collectors|repairers|processors', str(cl.get('cognito:groups', ''))):
+                  return resp(403, {'error': 'customers only'})
+              try:
+                  body = json.loads(e.get('body') or '{}')
+              except ValueError:
+                  body = None
+              if not isinstance(body, dict):
+                  return resp(400, {'error': 'invalid JSON body'})
+              rk = e['routeKey']
+              if rk == 'POST /upload-url':
+                  key = str(uuid.uuid4())   # random: the key never contains the owner id
+                  ct = 'image/png' if body.get('contentType') == 'image/png' else 'image/jpeg'
+                  url = s3.generate_presigned_url('put_object', Params={'Bucket': os.environ['BUCKET'], 'Key': key, 'ContentType': ct}, ExpiresIn=300)
+                  return resp(200, {'uploadUrl': url, 'photoKey': key, 'contentType': ct})
+              t, c, age = body.get('type'), body.get('condition'), body.get('age')
+              if t not in TYPES or c not in RULES or not isinstance(age, int) or isinstance(age, bool) or not 0 <= age <= 40:
+                  return resp(400, {'error': 'type, condition and age (0-40) are required'})
+              rec, why = triage(t, c, age)
+              a = {'recommended': rec, 'reason': why}
+              if rk == 'POST /assess':
+                  return resp(200, a)
+              cat, name, key = body.get('category', rec), body.get('name'), body.get('photoKey', '')
+              if cat not in CATS or not isinstance(name, str) or not name.strip() or not isinstance(key, str) or (key and not re.fullmatch(UUID, key)):
+                  return resp(400, {'error': 'a name, a valid category and a photo uploaded through the app are required'})
+              now = int(time.time())
+              item = {'deviceId': str(uuid.uuid4()), 'userId': uid, 'name': name.strip()[:100], 'type': t, 'condition': c, 'age': age,
+                      'category': cat, 'assessment': a, 'status': 'REGISTERED', 'photoKey': key, 'createdAt': now,
+                      'history': [{'s': 'REGISTERED', 't': now, 'by': uid, 'r': 'user'}]}
+              T.put_item(Item=item)
+              return resp(201, {'deviceId': item['deviceId'], 'assessment': a})
+
+  ListFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ListRole.Arn
+      Timeout: 15
+      Environment:
+        Variables: { DEVICES: !Ref DevicesTable, BUCKET: !Ref PhotoBucket }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, re, boto3
           from boto3.dynamodb.conditions import Key
           from botocore.config import Config
           T = boto3.resource('dynamodb').Table(os.environ['DEVICES'])
           s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
-          B = os.environ['BUCKET']
-          CATS = ('REUSE', 'REPAIR', 'RECYCLE')
-          SEE = {'collectors': ('SCHEDULED', 'COLLECTED', 'REPAIRED', 'RETURNED'),
+          SEE = {'collectors': ('SCHEDULED', 'PICKUP_FAILED', 'COLLECTED', 'REPAIRED', 'RETURNED'),
                  'repairers': ('COLLECTED', 'IN_REPAIR', 'REPAIRED', 'UNREPAIRABLE'),
-                 'processors': ('COLLECTED', 'UNREPAIRABLE', 'PROCESSING', 'REUSED', 'RECYCLED')}
+                 'processors': ('COLLECTED', 'UNREPAIRABLE', 'PROCESSING', 'LISTED', 'RESERVED', 'REUSED', 'RECYCLED')}
           def resp(c, b):
-              return {'statusCode': c, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(b, default=str)}
-          def role_of(cl):
-              g = re.findall(r'[a-z]+', str(cl.get('cognito:groups', '')))
-              return next((r for r in SEE if r in g), 'user')
+              return {'statusCode': c, 'body': json.dumps(b, default=str)}
           def visible(role, d):
               if d['status'] not in SEE[role]:
                   return False
@@ -213,165 +466,398 @@ Resources:
           def handler(e, ctx):
               cl = e['requestContext']['authorizer']['jwt']['claims']
               uid = cl['sub']
-              role = role_of(cl)
-              rk = e['routeKey']
-              body = json.loads(e.get('body') or '{}')
-              if rk in ('POST /upload-url', 'POST /devices') and role != 'user':
-                  return resp(403, {'error': 'customers only'})
-              if rk == 'POST /upload-url':
-                  key = uid + '/' + str(uuid.uuid4())
-                  url = s3.generate_presigned_url('put_object', Params={'Bucket': B, 'Key': key, 'ContentType': body.get('contentType', 'image/jpeg')}, ExpiresIn=300)
-                  return resp(200, {'uploadUrl': url, 'photoKey': key})
-              if rk == 'POST /devices':
-                  if body.get('category') not in CATS or not body.get('name'):
-                      return resp(400, {'error': 'name and a valid category are required'})
-                  now = int(time.time())
-                  item = {'deviceId': str(uuid.uuid4()), 'userId': uid, 'name': body['name'][:100],
-                          'type': body.get('type', 'other'), 'condition': body.get('condition', 'unknown'),
-                          'category': body['category'], 'status': 'REGISTERED',
-                          'photoKey': body.get('photoKey', ''), 'createdAt': now,
-                          'history': [{'s': 'REGISTERED', 't': now}]}
-                  T.put_item(Item=item)
-                  return resp(201, item)
-              if rk == 'GET /devices':
-                  if role == 'user':
-                      items = T.query(IndexName='userId-index', KeyConditionExpression=Key('userId').eq(uid))['Items']
-                  else:
-                      items = [d for d in T.scan()['Items'] if visible(role, d)]
-                  for i in items:
-                      if i.get('photoKey'):
-                          i['photoUrl'] = s3.generate_presigned_url('get_object', Params={'Bucket': B, 'Key': i['photoKey']}, ExpiresIn=300)
-                      if role not in ('user', 'collectors'):
-                          i.pop('userId', None)
-                          i.pop('address', None)
-                  return resp(200, {'items': items, 'role': role})
-              return resp(404, {'error': 'not found'})
+              role = next((r for r in SEE if r in re.findall(r'[a-z]+', str(cl.get('cognito:groups', '')))), 'user')
+              if role == 'user':
+                  items = T.query(IndexName='userId-index', KeyConditionExpression=Key('userId').eq(uid))['Items']
+              else:
+                  items = [d for d in T.scan()['Items'] if visible(role, d)]
+              for i in items:
+                  if i.get('photoKey'):
+                      i['photoUrl'] = s3.generate_presigned_url('get_object', Params={'Bucket': os.environ['BUCKET'], 'Key': i['photoKey']}, ExpiresIn=300)
+                  i['history'] = [{k: v for k, v in h.items() if k != 'by'} for h in i.get('history', [])]
+                  for k in ('userId', 'reservedBy', 'expiresAt', 'photoKey') + (() if role in ('user', 'collectors') else ('address',)):
+                      i.pop(k, None)
+              return resp(200, {'items': items, 'role': role})
 
-  ActionsFn:
+  PickupFn:
     Type: AWS::Lambda::Function
     Properties:
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt LambdaRole.Arn
+      Role: !GetAtt PickupRole.Arn
       Timeout: 15
       Environment:
-        Variables:
-          DEVICES: !Ref DevicesTable
-          REQUESTS: !Ref RequestsTable
-          QUEUE: !Ref PickupQueue
-          TOPIC: !Ref Topic
+        Variables: { DEVICES: !Ref DevicesTable, REQUESTS: !Ref RequestsTable, SLOTS: !Ref SlotsTable, QUEUE: !Ref PickupQueue, CAP: !Ref SlotCapacity }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, re, time, datetime as dt, boto3
+          from botocore.exceptions import ClientError
+          ddb = boto3.resource('dynamodb')
+          D, R, S = ddb.Table(os.environ['DEVICES']), ddb.Table(os.environ['REQUESTS']), ddb.Table(os.environ['SLOTS'])
+          sqs = boto3.client('sqs')
+          CAP = int(os.environ['CAP'])
+          WIN = ('09:00-12:00', '12:00-15:00', '15:00-18:00')
+          def resp(c, b):
+              return {'statusCode': c, 'body': json.dumps(b, default=str)}
+          def slots():
+              d0 = dt.datetime.now(dt.timezone.utc).date()
+              return [str(d0 + dt.timedelta(days=n)) + ' ' + w for n in range(2, 9) for w in WIN]
+          def handler(e, ctx):
+              cl = e['requestContext']['authorizer']['jwt']['claims']
+              uid = cl['sub']
+              if re.search(r'collectors|repairers|processors', str(cl.get('cognito:groups', ''))):
+                  return resp(403, {'error': 'customers only'})
+              if e['routeKey'] == 'GET /slots':
+                  booked = {i['slotId']: int(i.get('booked', 0)) for i in S.scan()['Items']}
+                  return resp(200, {'slots': [{'slot': s, 'left': CAP - booked.get(s, 0)} for s in slots() if booked.get(s, 0) < CAP]})
+              try:
+                  body = json.loads(e.get('body') or '{}')
+              except ValueError:
+                  body = None
+              if not isinstance(body, dict):
+                  return resp(400, {'error': 'invalid JSON body'})
+              did = e['pathParameters']['id']
+              d = D.get_item(Key={'deviceId': did}).get('Item')
+              if not d or d['userId'] != uid:
+                  return resp(404, {'error': 'device not found'})
+              st, now = d['status'], int(time.time())
+              if st not in ('REGISTERED', 'PICKUP_FAILED'):
+                  return resp(409, {'error': 'pickup already requested'})
+              if int(d.get('failedAttempts', 0)) >= 3:
+                  return resp(409, {'error': 'too many failed pickups, please contact support'})
+              addr = str(body.get('address') or d.get('address') or '').strip()[:200]
+              if not addr:
+                  return resp(400, {'error': 'address is required'})
+              h = {'s': 'PICKUP_REQUESTED', 'f': st, 't': now, 'by': uid, 'r': 'user'}
+              try:
+                  D.update_item(Key={'deviceId': did}, UpdateExpression='SET #s=:s, address=:a, history=list_append(if_not_exists(history,:e),:h) REMOVE slot',
+                                ConditionExpression='#s = :f', ExpressionAttributeNames={'#s': 'status'},
+                                ExpressionAttributeValues={':s': 'PICKUP_REQUESTED', ':a': addr, ':f': st, ':e': [], ':h': [h]})
+              except ClientError as ex:
+                  if ex.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return resp(409, {'error': 'the device changed, please refresh'})
+                  raise
+              R.put_item(Item={'requestId': did, 'deviceId': did, 'userId': uid, 'address': addr, 'status': 'PENDING', 'createdAt': now, 'expiresAt': now + 31536000})
+              sqs.send_message(QueueUrl=os.environ['QUEUE'], MessageBody=json.dumps({'requestId': did, 'deviceId': did}))
+              return resp(202, {'message': 'pickup requested'})
+
+  ChangeFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ChangeRole.Arn
+      Timeout: 15
+      Environment:
+        Variables: { DEVICES: !Ref DevicesTable, SLOTS: !Ref SlotsTable, CAP: !Ref SlotCapacity, CUTOFF: !Ref CancelCutoffHours }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, re, time, datetime as dt, boto3
+          from botocore.exceptions import ClientError
+          ddb = boto3.resource('dynamodb')
+          D, S = ddb.Table(os.environ['DEVICES']), ddb.Table(os.environ['SLOTS'])
+          CAP, CUT = int(os.environ['CAP']), int(os.environ['CUTOFF'])
+          WIN = ('09:00-12:00', '12:00-15:00', '15:00-18:00')
+          def resp(c, b):
+              return {'statusCode': c, 'body': json.dumps(b, default=str)}
+          def slots():
+              d0 = dt.datetime.now(dt.timezone.utc).date()
+              return [str(d0 + dt.timedelta(days=n)) + ' ' + w for n in range(2, 9) for w in WIN]
+          def code(ex):
+              return ex.response['Error']['Code']
+          def take(s):
+              try:
+                  S.update_item(Key={'slotId': s}, UpdateExpression='ADD booked :one SET expiresAt=:x', ConditionExpression='attribute_not_exists(booked) OR booked < :cap',
+                                ExpressionAttributeValues={':one': 1, ':cap': CAP, ':x': int(time.time()) + 1296000})
+                  return True
+              except ClientError as ex:
+                  if code(ex) != 'ConditionalCheckFailedException':
+                      raise
+                  return False
+          def free(s):
+              try:
+                  S.update_item(Key={'slotId': s}, UpdateExpression='ADD booked :m', ConditionExpression='booked > :z', ExpressionAttributeValues={':m': -1, ':z': 0})
+              except ClientError:
+                  pass
+          def handler(e, ctx):
+              cl = e['requestContext']['authorizer']['jwt']['claims']
+              uid, rk = cl['sub'], e['routeKey']
+              if re.search(r'collectors|repairers|processors', str(cl.get('cognito:groups', ''))):
+                  return resp(403, {'error': 'customers only'})
+              try:
+                  body = json.loads(e.get('body') or '{}')
+              except ValueError:
+                  body = None
+              if not isinstance(body, dict):
+                  return resp(400, {'error': 'invalid JSON body'})
+              did = e['pathParameters']['id']
+              d = D.get_item(Key={'deviceId': did}).get('Item')
+              if not d or d['userId'] != uid:
+                  return resp(404, {'error': 'device not found'})
+              if d['status'] != 'SCHEDULED':
+                  return resp(409, {'error': 'only a scheduled pickup can be changed'})
+              if dt.datetime.strptime(d['slot'][:16], '%Y-%m-%d %H:%M') - dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) < dt.timedelta(hours=CUT):
+                  return resp(409, {'error': 'too late to change this pickup (cutoff %d hours)' % CUT})
+              new = body.get('slot')
+              resched = rk == 'POST /devices/{id}/reschedule'
+              if resched and (new not in slots() or new == d['slot']):
+                  return resp(400, {'error': 'choose one of the available slots'})
+              if resched and not take(new):
+                  return resp(409, {'error': 'that slot is full'})
+              h = {'s': 'SCHEDULED' if resched else 'REGISTERED', 'f': 'SCHEDULED', 't': int(time.time()), 'by': uid, 'r': 'user', 'n': 'rescheduled' if resched else 'cancelled by customer'}
+              try:
+                  D.update_item(Key={'deviceId': did}, UpdateExpression='SET #s=:s, history=list_append(if_not_exists(history,:e),:h)' + (', slot=:t' if resched else ' REMOVE slot'),
+                                ConditionExpression='#s = :f AND slot = :o', ExpressionAttributeNames={'#s': 'status'},
+                                ExpressionAttributeValues=dict({':s': h['s'], ':f': 'SCHEDULED', ':o': d['slot'], ':e': [], ':h': [h]}, **({':t': new} if resched else {})))
+              except ClientError as ex:
+                  if resched:
+                      free(new)
+                  if code(ex) == 'ConditionalCheckFailedException':
+                      return resp(409, {'error': 'the pickup changed, please refresh'})
+                  raise
+              free(d['slot'])
+              return resp(200, {'slot': new} if resched else {'message': 'pickup cancelled'})
+
+  StatusFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt StatusRole.Arn
+      Timeout: 15
+      Environment:
+        Variables: { DEVICES: !Ref DevicesTable, SLOTS: !Ref SlotsTable }
       Tags: [{ Key: Project, Value: recircuit }]
       Code:
         ZipFile: |
           import json, os, re, time, boto3
+          from botocore.exceptions import ClientError
           ddb = boto3.resource('dynamodb')
-          D = ddb.Table(os.environ['DEVICES'])
-          R = ddb.Table(os.environ['REQUESTS'])
-          sqs = boto3.client('sqs')
-          sns = boto3.client('sns')
-          STAFF = ('collectors', 'repairers', 'processors')
-          # (current status, new status) -> role allowed to make the change
-          TR = {('SCHEDULED', 'COLLECTED'): 'collectors',
-                ('COLLECTED', 'IN_REPAIR'): 'repairers',
-                ('COLLECTED', 'PROCESSING'): 'processors',
-                ('IN_REPAIR', 'REPAIRED'): 'repairers',
-                ('IN_REPAIR', 'UNREPAIRABLE'): 'repairers',
-                ('UNREPAIRABLE', 'PROCESSING'): 'processors',
-                ('REPAIRED', 'RETURNED'): 'collectors',
-                ('PROCESSING', 'REUSED'): 'processors',
-                ('PROCESSING', 'RECYCLED'): 'processors'}
+          D, S = ddb.Table(os.environ['DEVICES']), ddb.Table(os.environ['SLOTS'])
+          ST = ('collectors', 'repairers', 'processors')
+          TR = {('SCHEDULED', 'COLLECTED'): 'collectors', ('SCHEDULED', 'PICKUP_FAILED'): 'collectors',
+                ('COLLECTED', 'IN_REPAIR'): 'repairers', ('COLLECTED', 'PROCESSING'): 'processors',
+                ('IN_REPAIR', 'REPAIRED'): 'repairers', ('IN_REPAIR', 'UNREPAIRABLE'): 'repairers',
+                ('UNREPAIRABLE', 'PROCESSING'): 'processors', ('REPAIRED', 'RETURNED'): 'collectors',
+                ('PROCESSING', 'REUSED'): 'processors', ('PROCESSING', 'RECYCLED'): 'processors',
+                ('PROCESSING', 'LISTED'): 'processors', ('LISTED', 'PROCESSING'): 'processors',
+                ('RESERVED', 'REUSED'): 'processors', ('RESERVED', 'LISTED'): 'processors'}
           def resp(c, b):
-              return {'statusCode': c, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(b, default=str)}
-          def setstatus(did, st, addr=None):
-              ex = 'SET #s=:s, history=list_append(if_not_exists(history,:e),:h)'
-              vals = {':s': st, ':e': [], ':h': [{'s': st, 't': int(time.time())}]}
-              if addr is not None:
-                  ex += ', address=:a'
-                  vals[':a'] = addr
-              D.update_item(Key={'deviceId': did}, UpdateExpression=ex, ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues=vals)
+              return {'statusCode': c, 'body': json.dumps(b, default=str)}
           def handler(e, ctx):
               cl = e['requestContext']['authorizer']['jwt']['claims']
               uid = cl['sub']
-              g = re.findall(r'[a-z]+', str(cl.get('cognito:groups', '')))
-              role = next((r for r in STAFF if r in g), 'user')
-              rk = e['routeKey']
-              body = json.loads(e.get('body') or '{}')
-              if rk == 'POST /subscribe':
-                  try:
-                      sns.subscribe(TopicArn=os.environ['TOPIC'], Protocol='email', Endpoint=cl['email'],
-                                    Attributes={'FilterPolicy': json.dumps({'userId': [uid]})})
-                  except Exception as ex:
-                      print('subscribe failed:', ex)
-                      return resp(200, {'message': 'This email is already subscribed, so you will receive updates.'})
-                  return resp(200, {'message': 'Check your inbox and confirm the subscription email'})
+              role = next((r for r in ST if r in re.findall(r'[a-z]+', str(cl.get('cognito:groups', '')))), 'user')
+              try:
+                  body = json.loads(e.get('body') or '{}')
+              except ValueError:
+                  body = None
+              if not isinstance(body, dict) or not isinstance(body.get('status'), str):
+                  return resp(400, {'error': 'a status is required'})
               did = e['pathParameters']['id']
               d = D.get_item(Key={'deviceId': did}).get('Item')
               if not d:
                   return resp(404, {'error': 'device not found'})
-              if rk == 'POST /devices/{id}/pickup':
-                  if d['userId'] != uid or role != 'user':
-                      return resp(403, {'error': 'not your device'})
-                  if d['status'] != 'REGISTERED':
-                      return resp(409, {'error': 'pickup already requested'})
-                  addr = (body.get('address') or '').strip()[:200]
-                  if not addr:
-                      return resp(400, {'error': 'address is required'})
-                  R.put_item(Item={'requestId': did, 'deviceId': did, 'userId': uid, 'address': addr,
-                                   'status': 'PENDING', 'createdAt': int(time.time())})
-                  setstatus(did, 'PICKUP_REQUESTED', addr)
-                  sqs.send_message(QueueUrl=os.environ['QUEUE'], MessageBody=json.dumps({'requestId': did, 'deviceId': did}))
-                  return resp(202, {'message': 'pickup requested'})
-              if rk == 'PATCH /devices/{id}/status':
-                  new = body.get('status')
-                  if not isinstance(new, str):
-                      return resp(400, {'error': 'status is required'})
-                  need = TR.get((d['status'], new))
-                  if not need:
-                      return resp(409, {'error': 'that status change is not allowed'})
-                  if role != need:
-                      return resp(403, {'error': 'only ' + need + ' can do this step'})
-                  if new == 'IN_REPAIR' and d['category'] != 'REPAIR':
-                      return resp(409, {'error': 'this device is not marked for repair'})
-                  if (d['status'], new) == ('COLLECTED', 'PROCESSING') and d['category'] == 'REPAIR':
-                      return resp(409, {'error': 'this device must be repaired first'})
-                  setstatus(did, new)
-                  return resp(200, {'message': 'updated'})
-              return resp(404, {'error': 'not found'})
+              frm, new, cat = d['status'], body['status'], d['category']
+              need = TR.get((frm, new))
+              if not need:
+                  return resp(409, {'error': 'that status change is not allowed'})
+              if role != need:
+                  return resp(403, {'error': 'only ' + need + ' can do this step'})
+              if (new == 'IN_REPAIR' and cat != 'REPAIR') or (frm == 'COLLECTED' and new == 'PROCESSING' and cat == 'REPAIR') or (new == 'LISTED' and frm == 'PROCESSING' and cat == 'RECYCLE'):
+                  return resp(409, {'error': 'not allowed for a device with the ' + cat.lower() + ' plan'})
+              note = body.get('note')
+              note = note.strip()[:100] if isinstance(note, str) else ''
+              now = int(time.time())
+              sets, rem = {}, []
+              if new == 'PICKUP_FAILED':
+                  if not note:
+                      return resp(400, {'error': 'a reason is required'})
+                  sets, rem = {'failedAttempts': int(d.get('failedAttempts', 0)) + 1, 'lastNote': note}, ['slot']
+              if new in ('RETURNED', 'REUSED', 'RECYCLED'):
+                  sets['expiresAt'] = now + 31536000
+              if new == 'LISTED':
+                  sets['listedAt'] = now
+                  rem = ['reservedBy'] if frm == 'RESERVED' else []
+              h = {'s': new, 'f': frm, 't': now, 'by': uid, 'r': role}
+              if note:
+                  h['n'] = note
+              ex = 'SET #s=:s, history=list_append(if_not_exists(history,:e),:h)' + ''.join(', %s=:%s' % (k, k) for k in sets) + (' REMOVE ' + ', '.join(rem) if rem else '')
+              v = dict({':s': new, ':f': frm, ':e': [], ':h': [h]}, **{':' + k: x for k, x in sets.items()})
+              try:
+                  D.update_item(Key={'deviceId': did}, UpdateExpression=ex, ConditionExpression='#s = :f', ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues=v)
+              except ClientError as ex:
+                  if ex.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return resp(409, {'error': 'the device changed, please refresh'})
+                  raise
+              if new == 'PICKUP_FAILED' and d.get('slot'):
+                  try:
+                      S.update_item(Key={'slotId': d['slot']}, UpdateExpression='ADD booked :m', ConditionExpression='booked > :z', ExpressionAttributeValues={':m': -1, ':z': 0})
+                  except ClientError:
+                      pass
+              return resp(200, {'message': 'updated'})
+
+  SubscribeFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SubscribeRole.Arn
+      Timeout: 10
+      Environment:
+        Variables: { TOPIC: !Ref Topic }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, re, boto3
+          sns = boto3.client('sns')
+          ST = ('collectors', 'repairers', 'processors')
+          def resp(c, b):
+              return {'statusCode': c, 'body': json.dumps(b)}
+          def handler(e, ctx):
+              cl = e['requestContext']['authorizer']['jwt']['claims']
+              role = next((r for r in ST if r in re.findall(r'[a-z]+', str(cl.get('cognito:groups', '')))), 'user')
+              # customers get mail about their own devices, staff about new tasks for their role
+              policy = {'staffRole': [role]} if role in ST else {'userId': [cl['sub']]}
+              try:
+                  sns.subscribe(TopicArn=os.environ['TOPIC'], Protocol='email', Endpoint=cl['email'], Attributes={'FilterPolicy': json.dumps(policy)})
+              except Exception as ex:
+                  print('subscribe failed:', ex)
+                  return resp(200, {'message': 'This email is already subscribed, so you will receive updates.'})
+              return resp(200, {'message': 'Check your inbox and confirm the subscription email'})
+
+  MarketFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt MarketRole.Arn
+      Timeout: 15
+      Environment:
+        Variables: { DEVICES: !Ref DevicesTable, BUCKET: !Ref PhotoBucket }
+      Tags: [{ Key: Project, Value: recircuit }]
+      Code:
+        ZipFile: |
+          import json, os, re, time, boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+          D = boto3.resource('dynamodb').Table(os.environ['DEVICES'])
+          s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+          B = os.environ['BUCKET']
+          FILTERS = {'type': ('laptop', 'phone', 'tablet', 'battery', 'appliance', 'other'),
+                     'condition': ('working', 'needs repair', 'broken'), 'category': ('REUSE', 'REPAIR', 'RECYCLE')}
+          def resp(c, b):
+              return {'statusCode': c, 'body': json.dumps(b, default=str)}
+          def mv(did, f, t, uid, sets=None, rem=()):
+              h = {'s': t, 'f': f, 't': int(time.time()), 'by': uid, 'r': 'user'}
+              sets = sets or {}
+              ex = 'SET #s=:s, history=list_append(if_not_exists(history,:e),:h)' + ''.join(', %s=:%s' % (k, k) for k in sets)
+              if rem:
+                  ex += ' REMOVE ' + ', '.join(rem)
+              v = {':s': t, ':f': f, ':e': [], ':h': [h]}
+              v.update({':' + k: x for k, x in sets.items()})
+              D.update_item(Key={'deviceId': did}, UpdateExpression=ex, ConditionExpression='#s = :f', ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues=v)
+          def handler(e, ctx):
+              cl = e['requestContext']['authorizer']['jwt']['claims']
+              uid, rk = cl['sub'], e['routeKey']
+              if rk == 'GET /market':
+                  q = e.get('queryStringParameters') or {}
+                  if any(k in q and q[k] not in FILTERS[k] for k in FILTERS):
+                      return resp(400, {'error': 'unknown filter value'})
+                  out = []
+                  for d in D.scan()['Items']:
+                      mine = d.get('reservedBy') == uid
+                      if not (d['status'] == 'LISTED' or (mine and d['status'] in ('RESERVED', 'REUSED'))):
+                          continue
+                      if any(k in q and d.get(k) != q[k] for k in FILTERS):
+                          continue
+                      item = {k: d.get(k) for k in ('deviceId', 'name', 'type', 'condition', 'age', 'category', 'status')}
+                      item['mine'] = mine
+                      if d.get('photoKey'):
+                          item['photoUrl'] = s3.generate_presigned_url('get_object', Params={'Bucket': B, 'Key': d['photoKey']}, ExpiresIn=300)
+                      out.append(item)
+                  return resp(200, {'items': out})
+              if re.search(r'collectors|repairers|processors', str(cl.get('cognito:groups', ''))):
+                  return resp(403, {'error': 'customers only'})
+              did = e['pathParameters']['id']
+              d = D.get_item(Key={'deviceId': did}).get('Item')
+              if not d:
+                  return resp(404, {'error': 'item not found'})
+              try:
+                  if rk == 'POST /market/{id}/reserve':
+                      if d['userId'] == uid:
+                          return resp(403, {'error': 'you cannot reserve your own device'})
+                      if d['status'] != 'LISTED':
+                          return resp(409, {'error': 'this item is not available'})
+                      mv(did, 'LISTED', 'RESERVED', uid, {'reservedBy': uid})
+                  else:
+                      if d.get('reservedBy') != uid or d['status'] != 'RESERVED':
+                          return resp(409, {'error': 'you have no reservation on this item'})
+                      mv(did, 'RESERVED', 'LISTED', uid, rem=('reservedBy',))
+              except ClientError as ex:
+                  if ex.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return resp(409, {'error': 'someone else got there first'})
+                  raise
+              return resp(200, {'message': 'ok'})
 
   WorkerFn:
     Type: AWS::Lambda::Function
     Properties:
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt LambdaRole.Arn
+      Role: !GetAtt WorkerRole.Arn
       Timeout: 30
       Environment:
-        Variables: { DEVICES: !Ref DevicesTable, REQUESTS: !Ref RequestsTable }
+        Variables: { DEVICES: !Ref DevicesTable, REQUESTS: !Ref RequestsTable, SLOTS: !Ref SlotsTable, CAP: !Ref SlotCapacity }
       Tags: [{ Key: Project, Value: recircuit }]
       Code:
         ZipFile: |
-          import json, os, time, datetime, boto3
+          import json, os, time, datetime as dt, boto3
+          from botocore.exceptions import ClientError
           ddb = boto3.resource('dynamodb')
-          D = ddb.Table(os.environ['DEVICES'])
-          R = ddb.Table(os.environ['REQUESTS'])
+          D, R, S = ddb.Table(os.environ['DEVICES']), ddb.Table(os.environ['REQUESTS']), ddb.Table(os.environ['SLOTS'])
+          CAP = int(os.environ['CAP'])
+          WIN = ('09:00-12:00', '12:00-15:00', '15:00-18:00')
+          def slots():
+              d0 = dt.datetime.now(dt.timezone.utc).date()
+              return [str(d0 + dt.timedelta(days=n)) + ' ' + w for n in range(2, 9) for w in WIN]
+          def take(s):
+              try:
+                  S.update_item(Key={'slotId': s}, UpdateExpression='ADD booked :one SET expiresAt=:x', ConditionExpression='attribute_not_exists(booked) OR booked < :cap',
+                                ExpressionAttributeValues={':one': 1, ':cap': CAP, ':x': int(time.time()) + 1296000})
+                  return True
+              except ClientError as ex:
+                  if ex.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                      raise
+                  return False
           def handler(e, ctx):
-              day = datetime.date.today() + datetime.timedelta(days=2)
-              slot = day.isoformat() + ' 10:00-13:00'
               for r in e['Records']:
-                  m = json.loads(r['body'])
-                  R.update_item(Key={'requestId': m['requestId']}, UpdateExpression='SET #s=:s, slot=:t',
-                                ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':s': 'SCHEDULED', ':t': slot})
-                  D.update_item(Key={'deviceId': m['deviceId']},
-                                UpdateExpression='SET #s=:s, slot=:t, history=list_append(if_not_exists(history,:e),:h)',
-                                ExpressionAttributeNames={'#s': 'status'},
-                                ExpressionAttributeValues={':s': 'SCHEDULED', ':t': slot, ':e': [], ':h': [{'s': 'SCHEDULED', 't': int(time.time())}]})
+                  did = json.loads(r['body'])['deviceId']
+                  d = D.get_item(Key={'deviceId': did}).get('Item')
+                  if not d or d['status'] != 'PICKUP_REQUESTED':
+                      continue                                    # duplicate or outdated message
+                  slot = next((s for s in slots() if take(s)), None)
+                  if not slot:
+                      raise RuntimeError('no free pickup slot')   # SQS retries, then the dead-letter queue and an alarm
+                  h = {'s': 'SCHEDULED', 'f': 'PICKUP_REQUESTED', 't': int(time.time()), 'by': 'system', 'r': 'system'}
+                  try:
+                      D.update_item(Key={'deviceId': did}, UpdateExpression='SET #s=:s, slot=:t, history=list_append(if_not_exists(history,:e),:h)',
+                                    ConditionExpression='#s = :f', ExpressionAttributeNames={'#s': 'status'},
+                                    ExpressionAttributeValues={':s': 'SCHEDULED', ':f': 'PICKUP_REQUESTED', ':t': slot, ':e': [], ':h': [h]})
+                  except ClientError:
+                      S.update_item(Key={'slotId': slot}, UpdateExpression='ADD booked :m', ExpressionAttributeValues={':m': -1})
+                      continue
+                  R.update_item(Key={'requestId': did}, UpdateExpression='SET #s=:s, slot=:t', ExpressionAttributeNames={'#s': 'status'},
+                                ExpressionAttributeValues={':s': 'SCHEDULED', ':t': slot})
 
   NotifierFn:
     Type: AWS::Lambda::Function
     Properties:
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt LambdaRole.Arn
+      Role: !GetAtt NotifierRole.Arn
       Timeout: 30
       Environment:
         Variables: { TOPIC: !Ref Topic }
@@ -380,32 +866,36 @@ Resources:
         ZipFile: |
           import os, boto3
           sns = boto3.client('sns')
-          TXT = {'PICKUP_REQUESTED': 'We received your pickup request.',
-                 'SCHEDULED': 'Pickup scheduled.',
-                 'COLLECTED': 'Our collector picked it up.',
-                 'IN_REPAIR': 'It is now being repaired.',
+          TXT = {'PICKUP_REQUESTED': 'We received your pickup request.', 'SCHEDULED': 'Pickup scheduled.',
+                 'PICKUP_FAILED': 'We could not collect it. You can request another slot.',
+                 'COLLECTED': 'Our collector picked it up.', 'IN_REPAIR': 'It is now being repaired.',
                  'REPAIRED': 'It has been repaired and will be returned to you.',
-                 'UNREPAIRABLE': 'It could not be repaired and will go to recycling/reuse.',
-                 'PROCESSING': 'It reached our processing partner.',
-                 'REUSED': 'It was refurbished and given a second life.',
-                 'RECYCLED': 'It was recycled responsibly.',
-                 'RETURNED': 'It has been returned to you.'}
+                 'UNREPAIRABLE': 'It could not be repaired and will go to recycling or reuse.',
+                 'PROCESSING': 'It reached our processing partner.', 'LISTED': 'It is now listed on the reuse marketplace.',
+                 'RESERVED': 'Someone reserved it from the marketplace.', 'REUSED': 'It was refurbished and given a second life.',
+                 'RECYCLED': 'It was recycled responsibly.', 'RETURNED': 'It has been returned to you.'}
+          STAFF = {'SCHEDULED': 'collectors', 'REPAIRED': 'collectors', 'UNREPAIRABLE': 'processors'}
+          def pub(subject, msg, attr, val):
+              sns.publish(TopicArn=os.environ['TOPIC'], Subject=subject, Message=msg, MessageAttributes={attr: {'DataType': 'String', 'StringValue': val}})
           def handler(e, ctx):
               for r in e['Records']:
                   if r['eventName'] != 'MODIFY':
                       continue
-                  n = r['dynamodb']['NewImage']
-                  o = r['dynamodb']['OldImage']
-                  st = n['status']['S']
-                  if st == o['status']['S']:
-                      continue
-                  slot = n.get('slot', {}).get('S', '')
-                  msg = "ReCircuit update for '%s': %s" % (n['name']['S'], st.replace('_', ' ').title())
-                  msg += '. ' + TXT.get(st, '')
-                  if st == 'SCHEDULED' and slot:
-                      msg += ' Slot: ' + slot + '.'
-                  sns.publish(TopicArn=os.environ['TOPIC'], Subject='ReCircuit status update', Message=msg,
-                              MessageAttributes={'userId': {'DataType': 'String', 'StringValue': n['userId']['S']}})
+                  n, o = r['dynamodb']['NewImage'], r['dynamodb']['OldImage']
+                  g = lambda i, k: i.get(k, {}).get('S', '')
+                  st, name, slot = g(n, 'status'), g(n, 'name'), g(n, 'slot')
+                  if st != g(o, 'status'):
+                      msg = "ReCircuit update for '%s': %s. %s" % (name, st.replace('_', ' ').title(), TXT.get(st, ''))
+                      if st == 'SCHEDULED' and slot:
+                          msg += ' Slot: ' + slot + '.'
+                      if st == 'PICKUP_FAILED':
+                          msg += ' Reason: ' + g(n, 'lastNote') + '.'
+                      pub('ReCircuit status update', msg, 'userId', n['userId']['S'])
+                      to = ('repairers' if g(n, 'category') == 'REPAIR' else 'processors') if st == 'COLLECTED' else STAFF.get(st)
+                      if to:
+                          pub('ReCircuit new task', "ReCircuit task: '%s' is waiting for you (%s)." % (name, st.replace('_', ' ').title()), 'staffRole', to)
+                  elif slot and slot != g(o, 'slot'):
+                      pub('ReCircuit pickup rescheduled', "ReCircuit: the pickup for '%s' moved to %s." % (name, slot), 'userId', n['userId']['S'])
 
   PickupMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -483,75 +973,234 @@ Resources:
         Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
         Audience: [!Ref UserPoolClient]
 
-  DevicesIntegration:
+  RegisterIntegration:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
       ApiId: !Ref Api
       IntegrationType: AWS_PROXY
       PayloadFormatVersion: '2.0'
-      IntegrationUri: !GetAtt DevicesFn.Arn
+      IntegrationUri: !GetAtt RegisterFn.Arn
 
-  ActionsIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref Api
-      IntegrationType: AWS_PROXY
-      PayloadFormatVersion: '2.0'
-      IntegrationUri: !GetAtt ActionsFn.Arn
-
-  RouteUpload:
+  RegisterRoute1:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
       RouteKey: POST /upload-url
       AuthorizationType: JWT
       AuthorizerId: !Ref Authorizer
-      Target: !Sub 'integrations/${DevicesIntegration}'
+      Target: !Sub 'integrations/${RegisterIntegration}'
 
-  RouteCreate:
+  RegisterRoute2:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /assess
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${RegisterIntegration}'
+
+  RegisterRoute3:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
       RouteKey: POST /devices
       AuthorizationType: JWT
       AuthorizerId: !Ref Authorizer
-      Target: !Sub 'integrations/${DevicesIntegration}'
+      Target: !Sub 'integrations/${RegisterIntegration}'
 
-  RouteList:
+  RegisterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RegisterFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  ListIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt ListFn.Arn
+
+  ListRoute1:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
       RouteKey: GET /devices
       AuthorizationType: JWT
       AuthorizerId: !Ref Authorizer
-      Target: !Sub 'integrations/${DevicesIntegration}'
+      Target: !Sub 'integrations/${ListIntegration}'
 
-  RoutePickup:
+  ListPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  PickupIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt PickupFn.Arn
+
+  PickupRoute1:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
       RouteKey: POST /devices/{id}/pickup
       AuthorizationType: JWT
       AuthorizerId: !Ref Authorizer
-      Target: !Sub 'integrations/${ActionsIntegration}'
+      Target: !Sub 'integrations/${PickupIntegration}'
 
-  RouteStatus:
+  PickupRoute2:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /slots
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${PickupIntegration}'
+
+  PickupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PickupFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  ChangeIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt ChangeFn.Arn
+
+  ChangeRoute1:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /devices/{id}/reschedule
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ChangeIntegration}'
+
+  ChangeRoute2:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /devices/{id}/cancel
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ChangeIntegration}'
+
+  ChangePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChangeFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  StatusIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt StatusFn.Arn
+
+  StatusRoute1:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
       RouteKey: PATCH /devices/{id}/status
       AuthorizationType: JWT
       AuthorizerId: !Ref Authorizer
-      Target: !Sub 'integrations/${ActionsIntegration}'
+      Target: !Sub 'integrations/${StatusIntegration}'
 
-  RouteSubscribe:
+  StatusPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StatusFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  SubscribeIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt SubscribeFn.Arn
+
+  SubscribeRoute1:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref Api
       RouteKey: POST /subscribe
       AuthorizationType: JWT
       AuthorizerId: !Ref Authorizer
-      Target: !Sub 'integrations/${ActionsIntegration}'
+      Target: !Sub 'integrations/${SubscribeIntegration}'
+
+  SubscribePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SubscribeFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  MarketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !GetAtt MarketFn.Arn
+
+  MarketRoute1:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /market
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${MarketIntegration}'
+
+  MarketRoute2:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /market/{id}/reserve
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${MarketIntegration}'
+
+  MarketRoute3:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /market/{id}/release
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${MarketIntegration}'
+
+  MarketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MarketFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
 
   Stage:
     Type: AWS::ApiGatewayV2::Stage
@@ -562,22 +1211,6 @@ Resources:
       DefaultRouteSettings:
         ThrottlingBurstLimit: 20
         ThrottlingRateLimit: 10
-
-  DevicesPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref DevicesFn
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
-
-  ActionsPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref ActionsFn
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
 
   # ---------- Monitoring ----------
   DLQAlarm:
@@ -598,10 +1231,9 @@ Resources:
   ErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmDescription: Errors in the API Lambda
+      AlarmDescription: Errors in any ReCircuit Lambda function (the built-in all-functions metric, so this is one free standard alarm)
       Namespace: AWS/Lambda
       MetricName: Errors
-      Dimensions: [{ Name: FunctionName, Value: !Ref DevicesFn }]
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

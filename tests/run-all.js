@@ -5,9 +5,11 @@ const fs = require('fs');
 const path = require('path');
 
 const root = __dirname;
+const venvPy = path.join(root, '.venv', 'Scripts', 'python.exe');
+const py = fs.existsSync(venvPy) ? venvPy : 'py';   // the venv has PyYAML (template checks), cfn-lint and PyMuPDF
 const steps = [
-  ['Lambda logic and template checks', 'py', ['-m', 'unittest', 'discover', '-s', 'backend']],
-  ['Browser tests (Chrome + mocked AWS)', process.execPath, ['--test', 'e2e/app.test.js']],
+  ['Lambda logic, security and template checks', py, ['-W', 'ignore', '-m', 'unittest', 'discover', '-s', 'backend']],
+  ['Browser tests (Chrome + mocked AWS)', process.execPath, ['--test', 'e2e/app.test.js', 'e2e/features.test.js']],
 ];
 const lint = path.join(root, '.venv', 'Scripts', 'cfn-lint.exe');
 if (fs.existsSync(lint)) steps.splice(1, 0, ['CloudFormation lint (cfn-lint)', lint, ['../recircuit-template.yaml']]);

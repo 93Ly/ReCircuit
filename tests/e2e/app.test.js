@@ -169,27 +169,50 @@ test('first sign-in of a staff account forces a new password', async () => {
 });
 
 // ---------------- customer features ----------------
-test('registering a device sends the right payload (with photo upload first)', async () => {
-  const t = await newPage({ api: (m, p) => {
+test('registering shows the triage recommendation, then sends age, category and the photo', async () => {
+  const t = await newPage({ api: (m, p, b) => {
     if (m === 'GET') return { json: { items: [], role: 'user' } };
-    if (p === '/upload-url') return { json: { uploadUrl: 'https://uploads.example/put', photoKey: 'user-1/photo-key' } };
+    if (p === '/assess') return { json: b.condition === 'needs repair' ? { recommended: 'REPAIR', reason: 'Repairable and at most 6 years old: worth repairing' } : { recommended: 'REUSE', reason: 'Working and at most 8 years old: suitable for refurbishment and reuse' } };
+    if (p === '/upload-url') return { json: { uploadUrl: 'https://uploads.example/put', photoKey: '11111111-1111-4111-8111-111111111111', contentType: 'image/png' } };
     return { status: 201, json: {} };
   } });
   await signedIn(t.page, base, jwt());
   await t.page.getByRole('button', { name: 'Register a device' }).click();
   assert.ok(await t.page.getByRole('dialog').isVisible());
+  await t.page.locator('#triage b').waitFor();
+  assert.match(await t.page.locator('#triage').innerText(), /Recommended: Reuse/);
+  assert.equal(await t.page.getByLabel('What should happen to it?').inputValue(), 'REUSE');
   await t.page.getByLabel('Device name').fill('Dell Inspiron');
   await t.page.getByLabel('Type').selectOption('laptop');
   await t.page.getByLabel('Condition').selectOption('needs repair');
-  await t.page.getByLabel('What should happen to it?').selectOption('REPAIR');
-  await t.page.getByLabel('Photo (optional)').setInputFiles({ name: 'p.png', mimeType: 'image/png', buffer: Buffer.from('89504e47', 'hex') });
+  await t.page.waitForFunction(() => /Recommended: Repair/.test(document.getElementById('triage').textContent));
+  assert.equal(await t.page.getByLabel('What should happen to it?').inputValue(), 'REPAIR', 'the plan follows the recommendation until the customer overrides it');
+  await t.page.getByLabel('Age in years').fill('2');
+  await t.page.getByLabel('Photo (optional, JPEG or PNG)').setInputFiles({ name: 'p.png', mimeType: 'image/png', buffer: Buffer.from('89504e47', 'hex') });
   await t.page.getByRole('button', { name: 'Register', exact: true }).click();
   await t.page.getByRole('dialog').waitFor({ state: 'hidden' });
   const up = t.calls.find(c => c.path === '/upload-url');
   assert.equal(up.body.contentType, 'image/png');
   const post = t.calls.find(c => c.method === 'POST' && c.path === '/devices');
-  assert.deepEqual(post.body, { name: 'Dell Inspiron', type: 'laptop', condition: 'needs repair', category: 'REPAIR', photoKey: 'user-1/photo-key' });
+  assert.deepEqual(post.body, { name: 'Dell Inspiron', type: 'laptop', condition: 'needs repair', age: 2, category: 'REPAIR', photoKey: '11111111-1111-4111-8111-111111111111' });
   assert.ok(t.calls.indexOf(up) < t.calls.indexOf(post), 'upload URL requested before creating the device');
+  await t.close();
+});
+
+test('a customer can override the recommendation, and bad ages are caught before sending', async () => {
+  const t = await newPage({ api: (m, p) => (m === 'GET' ? { json: { items: [], role: 'user' } } : p === '/assess' ? { json: { recommended: 'REUSE', reason: 'Working and at most 8 years old' } } : { status: 201, json: {} }) });
+  await signedIn(t.page, base, jwt());
+  await t.page.getByRole('button', { name: 'Register a device' }).click();
+  await t.page.locator('#triage b').waitFor();
+  await t.page.getByLabel('What should happen to it?').selectOption('RECYCLE');
+  await t.page.getByLabel('Age in years').fill('7');
+  await t.page.waitForTimeout(500);
+  assert.equal(await t.page.getByLabel('What should happen to it?').inputValue(), 'RECYCLE', 'an override sticks');
+  await t.page.getByLabel('Age in years').fill('50');
+  await t.page.waitForFunction(() => /whole number of years/.test(document.getElementById('triage').textContent));
+  await t.page.getByLabel('Device name').fill('X');
+  await t.page.getByRole('button', { name: 'Register', exact: true }).click();
+  assert.equal(t.calls.filter(c => c.method === 'POST' && c.path === '/devices').length, 0, 'an out-of-range age never reaches the API');
   await t.close();
 });
 

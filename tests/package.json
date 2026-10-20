@@ -4,7 +4,7 @@
   "description": "Automated tests for ReCircuit: Lambda logic (Python), template checks, and browser tests (Playwright + installed Chrome).",
   "scripts": {
     "test": "node run-all.js",
-    "test:e2e": "node --test e2e/",
+    "test:e2e": "node --test e2e/app.test.js e2e/features.test.js",
     "test:backend": "py -m unittest discover -s backend -v",
     "screenshots": "node e2e/screenshots.js"
   },

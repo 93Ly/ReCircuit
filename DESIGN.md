@@ -34,6 +34,11 @@ Headings: weight 700, letter-spacing -0.02em. Eyebrows: mono, 12px, uppercase, l
 - **Buttons**: rectangular, 4px radius, 40px min height, visible `:focus-visible` outline. Primary = solid action colour. Secondary = 1px outline.
 - **Modal**: `role="dialog"`, closes on Escape / backdrop, first field focused.
 - **Toast**: bottom-left, dark panel with a green left bar, `aria-live="polite"`.
+- **View tabs** (My devices / Reuse marketplace): text tabs, the selected one underlined in gold, no boxes.
+- **Filter bar**: labelled selects in a row above a table, no card around them.
+- **Triage box**: a tinted block with a gold left rule showing the recommendation and its reason. In table rows it is one small mono line ("TRIAGE: REPAIR (chosen: RECYCLE)").
+- **Failure note**: red text under the details, always with the reason and the attempt count.
+- **Slot picker**: a plain select inside a modal; options read "Tue, Jan 6, 09:00 to 12:00 (2 left)".
 
 ## Layout rules
 - Max content width 1040px. 16px side gutters on mobile. No horizontal scroll at 360px width (tested).

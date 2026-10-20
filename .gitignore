@@ -5,3 +5,6 @@ frontend/config.js
 # Windows folder metadata
 desktop.ini
 Desktop.ini
+
+# report folder holds screenshots with names, emails and the AWS account id
+report/

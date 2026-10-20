@@ -169,6 +169,16 @@
   .modal .acts { margin-top:4px; }
   #toast { position:fixed; left:16px; bottom:16px; background:var(--board); color:#e7efe9; border-left:4px solid var(--trace); padding:12px 16px; border-radius:3px; z-index:30; max-width:calc(100vw - 32px); font-size:14.5px; }
 
+  /* ---------- tabs, filters, triage ---------- */
+  .viewtabs { display:flex; gap:0; border-bottom:1px solid var(--rule); margin:0 0 22px; }
+  .viewtabs button { font:inherit; font-weight:600; background:none; border:0; border-bottom:3px solid transparent; padding:10px 16px; color:var(--muted); cursor:pointer; margin-bottom:-1px; }
+  .viewtabs button[aria-selected="true"] { color:var(--ink); border-bottom-color:var(--gold); }
+  .filters { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:18px; } .filters .field { margin:0; min-width:170px; }
+  .triage-box { border-left:3px solid var(--gold); background:var(--tint); padding:10px 12px; font-size:14px; margin:0 0 16px; }
+  .det .triage { font-family:var(--mono); font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--action); margin-top:3px; }
+  .det .note { color:var(--danger); margin-top:4px; }
+  .meta { color:var(--muted); font-size:14px; }
+
   /* ---------- trace art ---------- */
   .draw path.t { stroke-dasharray:1; stroke-dashoffset:1; animation:draw 2.2s ease-out .15s forwards; }
   .draw path.t:nth-of-type(2n) { animation-delay:.35s; }
@@ -329,8 +339,8 @@ document.querySelectorAll('[data-art]').forEach(e => e.innerHTML = art(e.dataset
 // ---------- constants ----------
 const STAFF = ['collectors', 'repairers', 'processors'];
 const ROLE_NAME = { user: 'Customer', collectors: 'Collector', repairers: 'Repair technician', processors: 'Processor' };
-const LABEL = { REGISTERED:'Registered', PICKUP_REQUESTED:'Pickup requested', SCHEDULED:'Pickup scheduled', COLLECTED:'Collected', IN_REPAIR:'In repair', REPAIRED:'Repaired', UNREPAIRABLE:'Unrepairable', RETURNED:'Returned', PROCESSING:'Processing', REUSED:'Reused', RECYCLED:'Recycled' };
-const PHASE = { REGISTERED:'wait', PICKUP_REQUESTED:'wait', SCHEDULED:'wait', COLLECTED:'live', IN_REPAIR:'live', PROCESSING:'live', REPAIRED:'done', RETURNED:'done', REUSED:'done', RECYCLED:'done', UNREPAIRABLE:'bad' };
+const LABEL = { REGISTERED:'Registered', PICKUP_REQUESTED:'Pickup requested', SCHEDULED:'Pickup scheduled', PICKUP_FAILED:'Pickup failed', COLLECTED:'Collected', LISTED:'Listed', RESERVED:'Reserved', IN_REPAIR:'In repair', REPAIRED:'Repaired', UNREPAIRABLE:'Unrepairable', RETURNED:'Returned', PROCESSING:'Processing', REUSED:'Reused', RECYCLED:'Recycled' };
+const PHASE = { REGISTERED:'wait', PICKUP_REQUESTED:'wait', SCHEDULED:'wait', PICKUP_FAILED:'bad', LISTED:'live', RESERVED:'live', COLLECTED:'live', IN_REPAIR:'live', PROCESSING:'live', REPAIRED:'done', RETURNED:'done', REUSED:'done', RECYCLED:'done', UNREPAIRABLE:'bad' };
 const FINAL = new Set(['RETURNED', 'REUSED', 'RECYCLED']);
 
 let token = sessionStorage.getItem('idt');
@@ -478,7 +488,8 @@ function startApp() {
   show('app');
   $('#roleTag').textContent = ROLE_NAME[role];
   $('#email').textContent = claims(token).email || '';
-  $('#notifyBtn').hidden = role !== 'user';
+  $('#notifyBtn').hidden = false;
+  $('#notifyBtn').textContent = role === 'user' ? 'Email me updates' : 'Email me new tasks';
   $('#dash').innerHTML = '<p class="eyebrow">Loading</p>';
   load(); clearInterval(timer); timer = setInterval(load, 20000);
 }
@@ -489,13 +500,19 @@ $('#notifyBtn').onclick = async () => { try { toast((await api('POST', '/subscri
 window.addEventListener('hashchange', () => { if (!valid(token)) route(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
-let ITEMS = [];
+let ITEMS = [], MARKET = [], VIEW = 'devices';
+const FILT = { type: '', condition: '' };
 async function load() {
   try {
+    if (roleOf(token) === 'user' && VIEW === 'market') {
+      const q = new URLSearchParams(Object.entries(FILT).filter(([, v]) => v)).toString();
+      MARKET = (await api('GET', '/market' + (q ? '?' + q : ''))).items;
+      return renderMarket();
+    }
     const { items, role } = await api('GET', '/devices');
     ITEMS = items.sort((a, b) => b.createdAt - a.createdAt);
     role === 'user' ? renderCustomer() : renderStaff(role);
-  } catch (e) { if (valid(token)) $('#dash').innerHTML = `<div class="table"><div class="empty">Could not load devices: ${esc(e.message)}</div></div>`; }
+  } catch (e) { if (valid(token)) $('#dash').innerHTML = `<div class="table"><div class="empty">Could not load: ${esc(e.message)}</div></div>`; }
 }
 
 // ---------- shared pieces ----------
@@ -504,36 +521,58 @@ const I = {
   chip: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="5" y="5" width="10" height="10" rx="1"/><path d="M8 2v3M12 2v3M8 15v3M12 15v3M2 8h3M2 12h3M15 8h3M15 12h3"/></svg>',
   empty: '<svg width="44" height="44" viewBox="0 0 44 44" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 14h12l6 6h18M4 30h10l5-5h21"/><circle cx="40" cy="20" r="3"/><circle cx="40" cy="25" r="3"/></svg>'
 };
+const RLABEL = { user: 'customer', collectors: 'collector', repairers: 'repair technician', processors: 'processor', system: 'system' };
+const CAT = { REUSE: 'Reuse', REPAIR: 'Repair', RECYCLE: 'Recycle' };
 const tag = s => `<span class="tag ${PHASE[s] || ''}"><i></i>${esc(LABEL[s] || s)}</span>`;
 const sid = d => '#' + String(d.deviceId).slice(0, 6);
 const fmtTime = t => new Date(Number(t) * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+const fmtSlot = s => { const [d, w] = String(s).split(' '); return new Date(d + 'T00:00:00Z').toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' }) + ', ' + String(w).replace('-', ' to '); };
 const thumb = d => d.photoUrl ? `<img class="thumb" src="${esc(d.photoUrl)}" alt="">` : `<span class="thumb">${I.chip}</span>`;
 function devCell(d) { return `<div class="dev">${thumb(d)}<div><b>${esc(d.name)}</b><span class="id">${esc(sid(d))}</span></div></div>`; }
+function facts(d) { return `${esc(d.type)} &middot; ${esc(d.condition)}${d.age != null ? ' &middot; ' + esc(d.age) + ' yr' + (d.age == 1 ? '' : 's') : ''} &middot; plan: ${esc(String(d.category).toLowerCase())}`; }
+function triageLine(d) {
+  const a = d.assessment; if (!a) return '';
+  const diff = a.recommended !== d.category ? ` (chosen: ${esc(CAT[d.category] || d.category)})` : '';
+  return `<div class="triage">Triage: ${esc(CAT[a.recommended] || a.recommended)}${diff}</div>`;
+}
 function pathFor(d) {
-  const repairPath = d.category === 'REPAIR' && !['UNREPAIRABLE', 'PROCESSING', 'REUSED', 'RECYCLED'].includes(d.status);
+  const market = ['LISTED', 'RESERVED'].includes(d.status) || (d.history || []).some(h => h.s === 'LISTED');
+  const repairPath = d.category === 'REPAIR' && !['UNREPAIRABLE', 'PROCESSING', 'LISTED', 'RESERVED', 'REUSED', 'RECYCLED'].includes(d.status);
   if (repairPath) return ['REGISTERED', 'PICKUP_REQUESTED', 'SCHEDULED', 'COLLECTED', 'IN_REPAIR', 'REPAIRED', 'RETURNED'];
+  if (market) return ['REGISTERED', 'PICKUP_REQUESTED', 'SCHEDULED', 'COLLECTED', 'PROCESSING', 'LISTED', 'RESERVED', 'REUSED'];
   const fin = ['REUSED', 'RECYCLED'].includes(d.status) ? d.status : (d.category === 'REUSE' ? 'REUSED' : 'RECYCLED');
   return ['REGISTERED', 'PICKUP_REQUESTED', 'SCHEDULED', 'COLLECTED', 'PROCESSING', fin];
 }
 function tracker(d) {
-  const p = pathFor(d); let idx = p.indexOf(d.status); if (idx < 0) idx = p.indexOf('COLLECTED');
+  const p = pathFor(d); let idx = p.indexOf(d.status); if (idx < 0) idx = p.indexOf(d.status === 'PICKUP_FAILED' ? 'SCHEDULED' : 'COLLECTED');
   const all = FINAL.has(d.status);
   return `<ol class="tracker">${p.map((s, i) => `<li class="${i < idx || all ? 'done' : ''} ${i === idx && !all ? 'now' : ''}">${esc(LABEL[s])}</li>`).join('')}</ol>`;
 }
 function historyList(d) {
   const h = (d.history || []).slice().sort((a, b) => a.t - b.t);
-  return h.length ? `<ul class="hist">${h.map(x => `<li><b>${esc(LABEL[x.s] || x.s)}</b> &middot; ${esc(fmtTime(x.t))}</li>`).join('')}</ul>` : '';
+  return h.length ? `<ul class="hist">${h.map(x => `<li><b>${esc(LABEL[x.s] || x.s)}</b> &middot; by ${esc(RLABEL[x.r] || 'unknown')} &middot; ${esc(fmtTime(x.t))}${x.n ? ' &middot; ' + esc(x.n) : ''}</li>`).join('')}</ul>` : '';
 }
 function counters(a, b, c) {
   return `<div class="counters">${[a, b, c].map(x => `<div class="counter"><b>${x[0]}</b><span>${x[1]}</span></div>`).join('')}</div>`;
 }
+const viewTabs = () => `<div class="viewtabs" role="tablist" aria-label="Customer sections">
+  <button role="tab" data-view="devices" aria-selected="${VIEW === 'devices'}">My devices</button>
+  <button role="tab" data-view="market" aria-selected="${VIEW === 'market'}">Reuse marketplace</button></div>`;
 
-// ---------- customer dashboard ----------
+// ---------- customer: my devices ----------
+function custActions(d) {
+  const id = esc(d.deviceId);
+  if (d.status === 'REGISTERED') return `<button class="btn sm" data-pickup="${id}">Request pickup</button>`;
+  if (d.status === 'PICKUP_FAILED') return `<button class="btn sm" data-pickup="${id}">Request another slot</button>`;
+  if (d.status === 'SCHEDULED') return `<button class="btn sm outline" data-resched="${id}">Reschedule</button><button class="btn sm danger" data-cancel="${id}">Cancel pickup</button>`;
+  return '';
+}
 function renderCustomer() {
   const total = ITEMS.length, done = ITEMS.filter(d => FINAL.has(d.status)).length;
   $('#dash').innerHTML = `
     <div class="page-head"><div><span class="eyebrow">Customer</span><h1>Your devices</h1><p>Register what you no longer use. We handle the route from here.</p></div>
       <button class="btn" id="addBtn">Register a device</button></div>
+    ${viewTabs()}
     ${counters([total, 'Registered'], [total - done, 'In progress'], [done, 'Completed'])}
     <div class="sec-h"><h2>Devices</h2><span class="n">${total}</span></div>
     <div class="table" role="table" aria-label="Your devices">
@@ -541,19 +580,58 @@ function renderCustomer() {
       ${total ? ITEMS.map(d => `
         <div class="trow-wrap" role="rowgroup">
           <div class="trow" role="row">${devCell(d)}
-            <div class="det">${esc(d.type)} &middot; ${esc(d.condition)} &middot; plan: ${esc(String(d.category).toLowerCase())}${d.slot ? `<br>Pickup ${esc(d.slot)}` : ''}</div>
+            <div class="det">${facts(d)}${triageLine(d)}${d.slot ? `<br>Pickup ${esc(fmtSlot(d.slot))}` : ''}${d.status === 'PICKUP_FAILED' ? `<div class="note">Pickup failed: ${esc(d.lastNote || 'no reason given')} (attempt ${esc(d.failedAttempts || 1)} of 3)</div>` : ''}</div>
             <div>${tag(d.status)}</div>
-            <div class="acts">${d.status === 'REGISTERED' ? `<button class="btn sm" data-pickup="${esc(d.deviceId)}">Request pickup</button>` : ''}</div></div>
+            <div class="acts">${custActions(d)}</div></div>
           <details class="track" data-id="${esc(d.deviceId)}" ${OPEN.has(d.deviceId) ? 'open' : ''}><summary>Track journey</summary>${tracker(d)}${historyList(d)}</details>
         </div>`).join('') : `<div class="empty">${I.empty}<span>No devices yet. Register your first one to start its route.</span></div>`}
     </div>`;
   $('#addBtn').onclick = openRegister;
 }
+
+// ---------- customer: reuse marketplace ----------
+function renderMarket() {
+  const opt = (arr, cur) => ['<option value="">All</option>'].concat(arr.map(v => `<option ${v === cur ? 'selected' : ''}>${v}</option>`)).join('');
+  $('#dash').innerHTML = `
+    <div class="page-head"><div><span class="eyebrow">Customer</span><h1>Reuse marketplace</h1><p>Refurbished devices from our processing partners. Owner details are never shown.</p></div></div>
+    ${viewTabs()}
+    <div class="filters">
+      <label class="field">Type<select id="fType">${opt(['laptop', 'phone', 'tablet', 'battery', 'appliance', 'other'], FILT.type)}</select></label>
+      <label class="field">Condition<select id="fCond">${opt(['working', 'needs repair', 'broken'], FILT.condition)}</select></label>
+    </div>
+    <div class="sec-h"><h2>Available and reserved by you</h2><span class="n">${MARKET.length}</span></div>
+    <div class="table" role="table" aria-label="Marketplace">
+      <div class="thead" role="row"><span>Device</span><span>Details</span><span>Status</span><span></span></div>
+      ${MARKET.length ? MARKET.map(d => `
+        <div class="trow" role="row">${devCell(d)}
+          <div class="det">${facts(d)}</div>
+          <div>${tag(d.status)}</div>
+          <div class="acts">${d.status === 'LISTED' ? `<button class="btn sm" data-reserve="${esc(d.deviceId)}">Reserve</button>`
+            : d.status === 'RESERVED' && d.mine ? `<button class="btn sm outline" data-release="${esc(d.deviceId)}">Release</button>`
+            : d.mine ? '<span class="meta">Handed over to you</span>' : ''}</div></div>`).join('')
+        : `<div class="empty">${I.empty}<span>Nothing matches. Try other filters, or check back later.</span></div>`}
+    </div>`;
+  $('#fType').onchange = e => { FILT.type = e.target.value; load(); };
+  $('#fCond').onchange = e => { FILT.condition = e.target.value; load(); };
+}
+
 $('#dash').addEventListener('toggle', ev => { const d = ev.target; if (d.matches && d.matches('details.track')) { d.open ? OPEN.add(d.dataset.id) : OPEN.delete(d.dataset.id); } }, true);
 $('#dash').addEventListener('click', ev => {
-  const p = ev.target.closest('[data-pickup]'); if (p) return openPickup(p.dataset.pickup);
-  const b = ev.target.closest('[data-to]'); if (b) return move(b.dataset.id, b.dataset.to, b);
+  const q = a => ev.target.closest(a);
+  let b;
+  if ((b = q('[data-view]'))) { VIEW = b.dataset.view; return load(); }
+  if ((b = q('[data-pickup]'))) return openPickup(b.dataset.pickup);
+  if ((b = q('[data-resched]'))) return openResched(b.dataset.resched);
+  if ((b = q('[data-cancel]'))) return openCancel(b.dataset.cancel);
+  if ((b = q('[data-reserve]'))) return act(b, 'POST', `/market/${b.dataset.reserve}/reserve`, 'Reserved. A processor will confirm the handover.');
+  if ((b = q('[data-release]'))) return act(b, 'POST', `/market/${b.dataset.release}/release`, 'Reservation released.');
+  if ((b = q('[data-reason]'))) return openReason(b.dataset.id, b.dataset.to);
+  if ((b = q('[data-to]'))) return move(b.dataset.id, b.dataset.to, b);
 });
+async function act(btn, method, path, ok, body) {
+  btn.disabled = true;
+  try { await api(method, path, body); toast(ok); load(); } catch (e) { toast(e.message); btn.disabled = false; }
+}
 
 // ---------- modals ----------
 function modal(html) {
@@ -562,33 +640,54 @@ function modal(html) {
   const f = o.querySelector('input,textarea,select'); if (f) f.focus();
 }
 function closeModal() { const o = $('#overlay'); o.hidden = true; o.innerHTML = ''; }
+const optTypes = ['laptop', 'phone', 'tablet', 'battery', 'appliance', 'other'].map(t => `<option>${t}</option>`).join('');
+
 function openRegister() {
   modal(`<span class="eyebrow">New device</span><h2>Register a device</h2><form id="rf">
     <label class="field">Device name<input name="name" required maxlength="100" placeholder="Dell Inspiron laptop"></label>
-    <div class="row2"><label class="field">Type<select name="type"><option>laptop</option><option>phone</option><option>tablet</option><option>battery</option><option>appliance</option><option>other</option></select></label>
+    <div class="row2"><label class="field">Type<select name="type">${optTypes}</select></label>
     <label class="field">Condition<select name="condition"><option>working</option><option>needs repair</option><option>broken</option></select></label></div>
+    <label class="field">Age in years<input name="age" type="number" min="0" max="40" step="1" value="3" required></label>
+    <div class="triage-box" id="triage" aria-live="polite">Assessing…</div>
     <label class="field">What should happen to it?<select name="category"><option value="REUSE">Reuse (donate or refurbish)</option><option value="REPAIR">Repair and return to me</option><option value="RECYCLE">Recycle</option></select></label>
-    <label class="field">Photo (optional)<input name="photo" type="file" accept="image/*"></label>
+    <label class="field">Photo (optional, JPEG or PNG)<input name="photo" type="file" accept="image/jpeg,image/png"></label>
     <div class="acts"><button type="button" class="btn outline" id="cx">Cancel</button><button class="btn" type="submit">Register</button></div></form>`);
   $('#cx').onclick = closeModal;
-  $('#rf').onsubmit = async ev => {
-    ev.preventDefault(); const f = new FormData(ev.target), btn = ev.target.querySelector('[type=submit]'); btn.disabled = true;
+  const f = $('#rf'); let touched = false, t = null;
+  f.category.onchange = () => { touched = true; };
+  const assess = async () => {
+    const age = Number(f.age.value);
+    if (f.age.value === '' || !Number.isInteger(age) || age < 0 || age > 40) { $('#triage').textContent = 'Enter the age as a whole number of years (0 to 40).'; return; }
     try {
-      const body = { name: f.get('name'), type: f.get('type'), condition: f.get('condition'), category: f.get('category') };
-      const photo = f.get('photo');
+      const a = await api('POST', '/assess', { type: f.type.value, condition: f.condition.value, age });
+      $('#triage').innerHTML = `<b>Recommended: ${esc(CAT[a.recommended] || a.recommended)}.</b> ${esc(a.reason)}.`;
+      if (!touched) f.category.value = a.recommended;
+    } catch (e) { $('#triage').textContent = 'Could not assess right now: ' + e.message; }
+  };
+  const later = () => { clearTimeout(t); t = setTimeout(assess, 250); };
+  [f.type, f.condition, f.age].forEach(el => { el.oninput = later; el.onchange = later; });
+  assess();
+  f.onsubmit = async ev => {
+    ev.preventDefault(); const fd = new FormData(f), btn = f.querySelector('[type=submit]'); btn.disabled = true;
+    try {
+      const body = { name: fd.get('name'), type: fd.get('type'), condition: fd.get('condition'), age: Number(fd.get('age')), category: fd.get('category') };
+      const photo = fd.get('photo');
       if (photo && photo.size) {
-        const { uploadUrl, photoKey } = await api('POST', '/upload-url', { contentType: photo.type });
-        const up = await fetch(uploadUrl, { method: 'PUT', headers: { 'Content-Type': photo.type }, body: photo });
-        if (!up.ok) throw new Error('Photo upload failed');
-        body.photoKey = photoKey;
+        if (!['image/jpeg', 'image/png'].includes(photo.type)) throw new Error('Please choose a JPEG or PNG photo.');
+        const up = await api('POST', '/upload-url', { contentType: photo.type });
+        const put = await fetch(up.uploadUrl, { method: 'PUT', headers: { 'Content-Type': up.contentType }, body: photo });
+        if (!put.ok) throw new Error('Photo upload failed');
+        body.photoKey = up.photoKey;
       }
       await api('POST', '/devices', body); closeModal(); toast('Device registered.'); load();
     } catch (e) { toast(e.message); btn.disabled = false; }
   };
 }
 function openPickup(id) {
-  modal(`<span class="eyebrow">Pickup</span><h2>Where should we collect it?</h2><form id="pf">
-    <label class="field">Pickup address<textarea name="address" rows="3" required maxlength="200" placeholder="House no., street, city, PIN"></textarea></label>
+  const d = ITEMS.find(x => x.deviceId === id) || {};
+  modal(`<span class="eyebrow">Pickup</span><h2>${d.status === 'PICKUP_FAILED' ? 'Request another slot' : 'Where should we collect it?'}</h2><form id="pf">
+    <label class="field">Pickup address<textarea name="address" rows="3" required maxlength="200" placeholder="House no., street, city, PIN">${esc(d.address || '')}</textarea></label>
+    <p class="hint">A time slot is assigned automatically, and you can reschedule it up to 24 hours before.</p>
     <div class="acts"><button type="button" class="btn outline" id="cx">Cancel</button><button class="btn" type="submit">Request pickup</button></div></form>`);
   $('#cx').onclick = closeModal;
   $('#pf').onsubmit = async ev => {
@@ -597,25 +696,62 @@ function openPickup(id) {
     catch (e) { toast(e.message); btn.disabled = false; }
   };
 }
+async function openResched(id) {
+  let slots;
+  try { slots = (await api('GET', '/slots')).slots; } catch (e) { return toast(e.message); }
+  modal(`<span class="eyebrow">Pickup</span><h2>Choose a new slot</h2><form id="sf">
+    <label class="field">Available slots<select name="slot" required>${slots.length ? slots.map(s => `<option value="${esc(s.slot)}">${esc(fmtSlot(s.slot))} (${esc(s.left)} left)</option>`).join('') : '<option value="">No slots available</option>'}</select></label>
+    <div class="acts"><button type="button" class="btn outline" id="cx">Close</button><button class="btn" type="submit" ${slots.length ? '' : 'disabled'}>Reschedule</button></div></form>`);
+  $('#cx').onclick = closeModal;
+  $('#sf').onsubmit = async ev => {
+    ev.preventDefault(); const btn = ev.target.querySelector('[type=submit]'); btn.disabled = true;
+    try { await api('POST', `/devices/${id}/reschedule`, { slot: ev.target.slot.value }); closeModal(); toast('Pickup rescheduled.'); load(); }
+    catch (e) { toast(e.message); btn.disabled = false; }
+  };
+}
+function openCancel(id) {
+  modal(`<span class="eyebrow">Pickup</span><h2>Cancel this pickup?</h2><p class="meta">The device goes back to Registered and its slot is freed. You can book again at any time.</p>
+    <div class="acts" style="margin-top:16px"><button class="btn outline" id="cx">Keep it</button><button class="btn danger" id="yes">Cancel pickup</button></div>`);
+  $('#cx').onclick = closeModal;
+  $('#yes').onclick = async ev => {
+    ev.target.disabled = true;
+    try { await api('POST', `/devices/${id}/cancel`, {}); closeModal(); toast('Pickup cancelled.'); load(); } catch (e) { toast(e.message); ev.target.disabled = false; }
+  };
+}
+function openReason(id, to) {
+  modal(`<span class="eyebrow">Collection</span><h2>Why could it not be collected?</h2><form id="xf">
+    <label class="field">Reason<select name="why"><option>Customer was not available</option><option>Wrong or incomplete address</option><option>Device was not ready</option><option>Other</option></select></label>
+    <label class="field">Details (optional)<input name="more" maxlength="60"></label>
+    <div class="acts"><button type="button" class="btn outline" id="cx">Cancel</button><button class="btn danger" type="submit">Record failed pickup</button></div></form>`);
+  $('#cx').onclick = closeModal;
+  $('#xf').onsubmit = async ev => {
+    ev.preventDefault(); const f = ev.target, btn = f.querySelector('[type=submit]'); btn.disabled = true;
+    const note = f.why.value + (f.more.value.trim() ? ': ' + f.more.value.trim() : '');
+    try { await api('PATCH', `/devices/${id}/status`, { status: to, note }); closeModal(); toast('Failed pickup recorded. The customer can book again.'); load(); }
+    catch (e) { toast(e.message); btn.disabled = false; }
+  };
+}
 
 // ---------- staff dashboards ----------
 const WORK = {
   collectors: { blurb: 'Collect devices from customers and deliver repaired ones back to them.', sections: [
-    { title: 'Pickups to collect', statuses: ['SCHEDULED'], addr: true, actions: [['COLLECTED', 'Mark collected']], empty: 'No pickups waiting.' },
-    { title: 'Repaired: deliver to customer', statuses: ['REPAIRED'], addr: true, actions: [['RETURNED', 'Mark returned']], empty: 'Nothing to deliver.' },
-    { title: 'Handled by collectors', statuses: ['COLLECTED', 'RETURNED'], actions: [], empty: 'Nothing yet.' }] },
+    { title: 'Pickups to collect', statuses: ['SCHEDULED'], addr: true, actions: () => [['COLLECTED', 'Mark collected'], ['PICKUP_FAILED', 'Collection failed', 'danger', true]], empty: 'No pickups waiting.' },
+    { title: 'Repaired: deliver to customer', statuses: ['REPAIRED'], addr: true, actions: () => [['RETURNED', 'Mark returned']], empty: 'Nothing to deliver.' },
+    { title: 'Failed pickups (waiting for the customer)', statuses: ['PICKUP_FAILED'], actions: () => [], empty: 'No failed pickups.' },
+    { title: 'Handled by collectors', statuses: ['COLLECTED', 'RETURNED'], actions: () => [], empty: 'Nothing yet.' }] },
   repairers: { blurb: 'Repair devices that customers asked to get fixed.', sections: [
-    { title: 'Incoming repairs', statuses: ['COLLECTED'], actions: [['IN_REPAIR', 'Start repair']], empty: 'No devices waiting for repair.' },
-    { title: 'In repair', statuses: ['IN_REPAIR'], actions: [['REPAIRED', 'Mark repaired'], ['UNREPAIRABLE', 'Cannot repair', 'danger']], empty: 'Nothing on the bench.' },
-    { title: 'Finished', statuses: ['REPAIRED', 'UNREPAIRABLE'], actions: [], empty: 'Nothing yet.' }] },
-  processors: { blurb: 'Refurbish devices for reuse or dismantle them for recycling.', sections: [
-    { title: 'Incoming for processing', statuses: ['COLLECTED', 'UNREPAIRABLE'], actions: [['PROCESSING', 'Start processing']], empty: 'No devices waiting.' },
-    { title: 'In processing', statuses: ['PROCESSING'], actions: [['REUSED', 'Mark reused'], ['RECYCLED', 'Mark recycled']], empty: 'Nothing in processing.' },
-    { title: 'Completed', statuses: ['REUSED', 'RECYCLED'], actions: [], empty: 'Nothing yet.' }] }
+    { title: 'Incoming repairs', statuses: ['COLLECTED'], actions: () => [['IN_REPAIR', 'Start repair']], empty: 'No devices waiting for repair.' },
+    { title: 'In repair', statuses: ['IN_REPAIR'], actions: () => [['REPAIRED', 'Mark repaired'], ['UNREPAIRABLE', 'Cannot repair', 'danger']], empty: 'Nothing on the bench.' },
+    { title: 'Finished', statuses: ['REPAIRED', 'UNREPAIRABLE'], actions: () => [], empty: 'Nothing yet.' }] },
+  processors: { blurb: 'Refurbish devices for reuse, list them on the marketplace, or dismantle them for recycling.', sections: [
+    { title: 'Incoming for processing', statuses: ['COLLECTED', 'UNREPAIRABLE'], actions: () => [['PROCESSING', 'Start processing']], empty: 'No devices waiting.' },
+    { title: 'In processing', statuses: ['PROCESSING'], actions: d => [['REUSED', 'Mark reused'], ['RECYCLED', 'Mark recycled']].concat(d.category === 'RECYCLE' ? [] : [['LISTED', 'List on marketplace', 'outline']]), empty: 'Nothing in processing.' },
+    { title: 'On the marketplace', statuses: ['LISTED', 'RESERVED'], actions: d => d.status === 'LISTED' ? [['PROCESSING', 'Delist', 'outline']] : [['REUSED', 'Confirm handover'], ['LISTED', 'Release reservation', 'outline']], empty: 'Nothing listed.' },
+    { title: 'Completed', statuses: ['REUSED', 'RECYCLED'], actions: () => [], empty: 'Nothing yet.' }] }
 };
 function renderStaff(role) {
   const W = WORK[role];
-  const open = W.sections.filter(s => s.actions.length).reduce((n, s) => n + ITEMS.filter(d => s.statuses.includes(d.status)).length, 0);
+  const open = W.sections.reduce((n, s) => n + ITEMS.filter(d => s.statuses.includes(d.status) && s.actions(d).length).length, 0);
   $('#dash').innerHTML = `
     <div class="page-head"><div><span class="eyebrow">${esc(ROLE_NAME[role])}</span><h1>Task queue</h1><p>${W.blurb}</p></div></div>
     ${counters([open, 'Tasks for you'], [ITEMS.length, 'Devices visible'], [ITEMS.length - open, 'Already handled'])}
@@ -626,9 +762,9 @@ function renderStaff(role) {
         ${list.length ? `<div class="thead" role="row"><span>Device</span><span>${s.addr ? 'Location' : 'Details'}</span><span>Status</span><span></span></div>` : ''}
         ${list.length ? list.map(d => `
           <div class="trow" role="row">${devCell(d)}
-            <div class="det">${esc(d.type)} &middot; ${esc(d.condition)} &middot; plan: ${esc(String(d.category).toLowerCase())}${d.slot ? `<br>Slot ${esc(d.slot)}` : ''}${s.addr && d.address ? `<div class="loc">${I.pin}<span>${esc(d.address)}</span></div>` : ''}</div>
+            <div class="det">${facts(d)}${triageLine(d)}${d.slot ? `<br>Slot ${esc(fmtSlot(d.slot))}` : ''}${d.status === 'PICKUP_FAILED' ? `<div class="note">Reason: ${esc(d.lastNote || '')}</div>` : ''}${s.addr && d.address ? `<div class="loc">${I.pin}<span>${esc(d.address)}</span></div>` : ''}</div>
             <div>${tag(d.status)}</div>
-            <div class="acts">${s.actions.map(a => `<button class="btn sm ${a[2] || ''}" data-id="${esc(d.deviceId)}" data-to="${a[0]}">${a[1]}</button>`).join('')}</div></div>`).join('')
+            <div class="acts">${s.actions(d).map(a => `<button class="btn sm ${a[2] || ''}" data-id="${esc(d.deviceId)}" data-to="${a[0]}"${a[3] ? ' data-reason="1"' : ''}>${a[1]}</button>`).join('')}</div></div>`).join('')
           : `<div class="empty">${I.empty}<span>${esc(s.empty)}</span></div>`}
       </div>`; }).join('')}`;
 }
